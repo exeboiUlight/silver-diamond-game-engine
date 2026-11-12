@@ -1,0 +1,4 @@
+build/*
+bin/*
+
+audio_mix.wav
