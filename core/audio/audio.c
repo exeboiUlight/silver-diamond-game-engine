@@ -45,7 +45,7 @@ typedef struct {
 #include <pthread.h>
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 #define A_LOCK()   pthread_mutex_lock(&g_lock)
-#define A_UNLOCK() pthread_unlock(&g_lock)
+#define A_UNLOCK() pthread_mutex_unlock(&g_lock)
 #else
 #define A_LOCK()   ((void)0)
 #define A_UNLOCK() ((void)0)
