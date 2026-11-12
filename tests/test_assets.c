@@ -183,6 +183,21 @@ int main(int argc, char **argv) {
         }
         CHECK(sdge_load_gltf("no/such/file.glb") == NULL,
               "gltf: missing file fails");
+
+        sdge_gltf_model *scene = sdge_load_gltf("assets/scene.gltf");
+        CHECK(scene != NULL, "gltf: textured scene loads");
+        if (scene) {
+            CHECK(scene->texture_count > 0, "gltf: scene has textures");
+            int textured = 0;
+            for (int i = 0; i < scene->material_count; ++i) {
+                if (scene->materials[i].base_color_texture >= 0) {
+                    textured = 1;
+                    break;
+                }
+            }
+            CHECK(textured, "gltf: baseColorTexture is resolved");
+            sdge_gltf_destroy(scene);
+        }
     }
 
     /* ------------------------------------------- engine audio buffers */

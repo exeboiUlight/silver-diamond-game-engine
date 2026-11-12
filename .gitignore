@@ -1,4 +1,7 @@
-build/*
-bin/*
-
+./.gitignore
+API
+build
+bin
+__pycache__
 audio_mix.wav
+API/lib/

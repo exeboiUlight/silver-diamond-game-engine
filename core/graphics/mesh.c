@@ -13,14 +13,10 @@
 
 #include <glad/glad.h>
 
-/* upload `count` elements x `comps` floats; converts non-float accessors
- * (u8/u16/u32, optionally normalized) into a float32 buffer once.
- * returns a malloc'd array the caller frees, or NULL when zero-copy is
- * possible (the accessor data itself is used directly). */
 static float *m_to_f32(const sdge_accessor *a, int normalized_default) {
     if (a->count <= 0 || a->comps <= 0) return NULL;
     if (a->ctype == SDGE_GLTF_FLOAT && !a->normalized)
-        return NULL;                                   /* zero-copy path */
+        return NULL;
 
     int n = a->count * a->comps;
     float *out = (float *)malloc(sizeof(float) * (size_t)n);
@@ -54,7 +50,7 @@ static float *m_to_f32(const sdge_accessor *a, int normalized_default) {
             v = (float)x; break;
         }
         case SDGE_GLTF_FLOAT: {
-            memcpy(&v, p, 4); break;                    /* normalized float */
+            memcpy(&v, p, 4); break;
         }
         default: v = 0.0f; break;
         }
@@ -67,7 +63,7 @@ static void m_upload_attrib(unsigned *vbo, int location, int comps,
                              const sdge_accessor *a) {
     float *conv = m_to_f32(a, 0);
     const void *data = conv ? (const void *)conv : (const void *)a->data;
-    int stride = conv ? 0 : a->stride;   /* converted data is tightly packed */
+    int stride = conv ? 0 : a->stride;
 
     glGenBuffers(1, vbo);
     glBindBuffer(GL_ARRAY_BUFFER, *vbo);
@@ -98,6 +94,13 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
         out->has_normals = 1;
     }
 
+    /* TEXCOORD_0 -> attribute 4 (aUV) */
+    if (prim->texcoords.count > 0 && prim->texcoords.comps == 2
+        && prim->texcoords.count == prim->positions.count) {
+        m_upload_attrib(&out->vbo_tex, 4, 2, &prim->texcoords);
+        out->has_texcoords = 1;
+    }
+
     /* joints + weights interleaved as 8 floats (joint, weight) x4 */
     if (prim->joints.count > 0 && prim->weights.count > 0
         && prim->joints.comps == 4 && prim->weights.comps == 4
@@ -113,7 +116,7 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
                 float inv = wsum > 1e-6f ? 1.0f / wsum : 0.0f;
                 for (int k = 0; k < 4; ++k) {
                     jw[i*8+k]   = joints[i*4+k];
-                    jw[i*8+4+k] = weights[i*4+k] * inv;   /* renormalize */
+                    jw[i*8+4+k] = weights[i*4+k] * inv;
                 }
             }
             glGenBuffers(1, &out->vbo_skin);
@@ -143,14 +146,13 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
             out->index_count = ia->count;
             out->index_type = (ia->ctype == SDGE_GLTF_UNSIGNED_SHORT) ? 3 : 4;
         } else {
-            /* byte-sized indices: convert to u16 once */
             unsigned short *idx = (unsigned short *)malloc(
                 sizeof(unsigned short) * (size_t)ia->count);
             if (!idx) { sdge_mesh_destroy(out); return -3; }
             int csz = (ia->ctype == SDGE_GLTF_BYTE || ia->ctype == SDGE_GLTF_UNSIGNED_BYTE) ? 1 : 2;
             for (int i = 0; i < ia->count; ++i) {
                 const unsigned char *p = ia->data + (size_t)i * (size_t)ia->stride;
-                if (csz == 1) idx[i] = (unsigned short)p[0];   /* byte indices are effectively unsigned */
+                if (csz == 1) idx[i] = (unsigned short)p[0];
                 else idx[i] = (unsigned short)(p[0] | (p[1] << 8));
             }
             glGenBuffers(1, &out->ebo);
@@ -164,7 +166,6 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
         }
     }
 
-    /* bounding sphere: accessor min/max, or computed from data when absent */
     const sdge_accessor *pa = &prim->positions;
     float mn[3] = { 0,0,0 }, mx[3] = { 0,0,0 };
     int have = 0;
@@ -207,15 +208,12 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
         r += d * d;
     }
     out->bounds_radius = sqrtf(r);
-    if (!have) out->bounds_radius = 1e9f;             /* unknown: never cull */
+    if (!have) out->bounds_radius = 1e9f;
 
     glBindVertexArray(0);
     return 0;
 }
 
-/* ------------------------------------------------- procedural meshes */
-
-/* uploads a plain position/normal/index mesh */
 static int mesh_upload_raw(sdge_mesh *out, const float *verts, int vcount,
                            const unsigned short *idx, int icount) {
     memset(out, 0, sizeof(*out));
@@ -276,8 +274,6 @@ SDGE_API int sdge_mesh_create_box(sdge_mesh *out, float hw, float hh, float hd) 
             vi++;
         }
         unsigned short base = (unsigned short)(f * 4);
-        /* the mirrored faces need the opposite winding, otherwise they are
-         * back facing and get culled */
         if (sign > 0.0f) {
             idx[ii++] = base;     idx[ii++] = base + 1; idx[ii++] = base + 2;
             idx[ii++] = base;     idx[ii++] = base + 2; idx[ii++] = base + 3;
@@ -325,7 +321,6 @@ SDGE_API int sdge_mesh_create_sphere(sdge_mesh *out, float radius,
         for (int sl = 0; sl < slices; ++sl) {
             unsigned short a = (unsigned short)(s * (slices + 1) + sl);
             unsigned short b = (unsigned short)(a + slices + 1);
-            /* counter clockwise when seen from outside */
             idx[ii++] = a;     idx[ii++] = a + 1; idx[ii++] = b;
             idx[ii++] = a + 1; idx[ii++] = b + 1; idx[ii++] = b;
         }
@@ -342,6 +337,7 @@ SDGE_API void sdge_mesh_destroy(sdge_mesh *m) {
     glDeleteVertexArrays(1, &m->vao);
     if (m->vbo_pos)  glDeleteBuffers(1, &m->vbo_pos);
     if (m->vbo_nrm)  glDeleteBuffers(1, &m->vbo_nrm);
+    if (m->vbo_tex)  glDeleteBuffers(1, &m->vbo_tex);
     if (m->vbo_skin) glDeleteBuffers(1, &m->vbo_skin);
     if (m->ebo)      glDeleteBuffers(1, &m->ebo);
     memset(m, 0, sizeof(*m));
@@ -356,7 +352,6 @@ SDGE_API void sdge_mesh_world_sphere(const sdge_mesh *m, const sdg_mat4 world,
     center_out[0] = t[0] / (t[3] ? t[3] : 1.0f);
     center_out[1] = t[1] / (t[3] ? t[3] : 1.0f);
     center_out[2] = t[2] / (t[3] ? t[3] : 1.0f);
-    /* worst-case scale from column lengths (rotation+scale, no shear) */
     float s = 0.0f;
     for (int col = 0; col < 3; ++col) {
         float l = sqrtf(world[col*4+0]*world[col*4+0]
@@ -373,10 +368,23 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
                                const sdge_gltf_material *material) {
     (void)prim; (void)material;
     memset(out, 0, sizeof(*out));
-    return -1;                                    /* no GL in this build */
+    return -1;
 }
 
 SDGE_API void sdge_mesh_destroy(sdge_mesh *m) { (void)m; }
+
+SDGE_API int sdge_mesh_create_box(sdge_mesh *out, float hw, float hh, float hd) {
+    (void)hw; (void)hh; (void)hd;
+    memset(out, 0, sizeof(*out));
+    return -1;
+}
+
+SDGE_API int sdge_mesh_create_sphere(sdge_mesh *out, float radius,
+                                      int slices, int stacks) {
+    (void)radius; (void)slices; (void)stacks;
+    memset(out, 0, sizeof(*out));
+    return -1;
+}
 
 SDGE_API void sdge_mesh_world_sphere(const sdge_mesh *m, const sdg_mat4 world,
                                      float center_out[3], float *radius_out) {

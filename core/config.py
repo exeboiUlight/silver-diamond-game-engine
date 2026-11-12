@@ -6,6 +6,7 @@ config = [
     "assets/mp3.c",
     "assets/font.c",
     "assets/font_cff.c",
+    "assets/texture.c",
     "anim/anim.c",
     "audio/audio.c",
     "graphics/mesh.c",

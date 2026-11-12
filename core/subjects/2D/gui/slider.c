@@ -32,6 +32,9 @@ static void slider_event(sdge_gui *gui, sdge_widget *w, int type, int param) {
     (void)param;
 
     switch (type) {
+    case SDGE_WIDGET_PRESS:
+        s->dragging = 1;
+        /* fall through */
     case SDGE_WIDGET_HOVER:
         if (s->dragging) {
             float mx = 0.0f, my = 0.0f;
@@ -47,6 +50,7 @@ static void slider_event(sdge_gui *gui, sdge_widget *w, int type, int param) {
         }
         break;
     case SDGE_WIDGET_CLICK:
+    case SDGE_WIDGET_UNHOVER:
         s->dragging = 0;
         break;
     default:

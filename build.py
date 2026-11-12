@@ -15,6 +15,7 @@ Usage:
     python build.py rebuild       clean + build
     python build.py clean         remove the whole build/ directory
     python build.py test          run the test suite (tests/run_tests.py)
+    python build.py sdk           build the engine and export the C SDK to API/
 
 Options:
     --debug         build with -O0 -g (default is release: -O2 -DNDEBUG)
@@ -90,6 +91,42 @@ class Main:
         # ALSA is optional on Linux (WSL images may lack it)
         self.has_asound = (not self.is_windows) and \
             os.path.exists("/usr/include/alsa/asoundlib.h")
+
+        self.sdk_headers = [
+            "sdge_def.h",
+            "graphics/window.h",
+            "math/math3d.h",
+            "assets/assets.h",
+            "assets/gltf.h",
+            "assets/json.h",
+            "assets/mp3.h",
+            "assets/font.h",
+            "assets/texture.h",
+            "anim/anim.h",
+            "audio/audio.h",
+            "graphics/mesh.h",
+            "graphics/renderer.h",
+            "graphics/ui.h",
+            "subjects/3D/Camera.h",
+            "subjects/3D/model.h",
+            "subjects/3D/light/AmbientLight.h",
+            "subjects/3D/light/PointLight.h",
+            "subjects/3D/light/Sun.h",
+            "subjects/2D/Camera.h",
+            "subjects/2D/gui/gui.h",
+            "subjects/2D/gui/div.h",
+            "subjects/2D/gui/button.h",
+            "subjects/2D/gui/input.h",
+            "subjects/2D/gui/label.h",
+            "subjects/2D/gui/checkbox.h",
+            "subjects/2D/gui/progress.h",
+            "subjects/2D/gui/slider.h",
+            "subjects/2D/gui/radio.h",
+            "subjects/2D/gui/listbox.h",
+            "physics/physics2d.h",
+            "physics/physics3d.h",
+            "scene/scene.h",
+        ]
 
     # ------------------------------------------------------------- toolchain
     def find_compiler(self):
@@ -267,7 +304,7 @@ class Main:
                     return True
         return False
 
-    def build(self):
+    def build(self, build_app=True):
         if not self.cc:
             where = " (looked in C:\\MinGW\\bin and PATH)" if self.is_windows \
                 else " (looked for gcc/clang/cc in PATH)"
@@ -276,7 +313,8 @@ class Main:
 
         engine = self.engine_sources()
         app = self.app_sources()
-        missing = [s for s, _ in engine + app if not os.path.isfile(self.abspath(s))]
+        sources = engine + (app if build_app else [])
+        missing = [s for s, _ in sources if not os.path.isfile(self.abspath(s))]
         if missing:
             print("[build] ERROR: sources listed in config but not on disk:")
             for s in missing:
@@ -310,6 +348,9 @@ class Main:
         else:
             print(f"[build] {self.dll} is up to date ({len(engine_objs)} objects)")
 
+        if not build_app:
+            return True
+
         # ---- app ----
         compiled_app = compile_all(app, is_engine=False)
         if compiled_app is None:
@@ -336,6 +377,52 @@ class Main:
         else:
             print(f"[build] {self.out} is up to date ({len(app_objs)} objects)")
         return True
+
+    def export_sdk(self):
+        include_dir = os.path.join("API", "include")
+        for header in self.sdk_headers:
+            source = self.abspath(os.path.join("core", header))
+            target = self.abspath(os.path.join(include_dir, header))
+            if not os.path.isfile(source):
+                print(f"[sdk] ERROR: public header not found: {source}")
+                return False
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                shutil.copy2(source, target)
+            except OSError as exc:
+                print(f"[sdk] ERROR: cannot export {header}: {exc}")
+                return False
+
+        umbrella = self.abspath(os.path.join("core", "sdge.h"))
+        try:
+            shutil.copy2(umbrella, self.abspath(os.path.join(include_dir, "sdge.h")))
+        except OSError as exc:
+            print(f"[sdk] ERROR: cannot export sdge.h: {exc}")
+            return False
+
+        lib_dir = os.path.join("API", "lib", self.platform, self.variant)
+        target_dir = self.abspath(lib_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        artifacts = [(self.dll, os.path.basename(self.dll))]
+        if self.implib:
+            artifacts.append((self.implib, os.path.basename(self.implib)))
+        for source_rel, name in artifacts:
+            source = self.abspath(source_rel)
+            if not os.path.isfile(source):
+                print(f"[sdk] ERROR: build artifact not found: {source}")
+                return False
+            try:
+                shutil.copy2(source, os.path.join(target_dir, name))
+            except OSError as exc:
+                print(f"[sdk] ERROR: cannot export {name}: {exc}")
+                return False
+
+        print(f"[sdk] exported C headers to {include_dir}")
+        print(f"[sdk] exported {self.platform}/{self.variant} libraries to {lib_dir}")
+        return True
+
+    def sdk(self):
+        return self.build(build_app=False) and self.export_sdk()
 
     def run(self):
         if not self.build():
@@ -390,7 +477,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Silver Diamond Game Engine build script")
     ap.add_argument("command", nargs="?", default="build",
-                    choices=["build", "run", "rebuild", "clean", "test"],
+                    choices=["build", "run", "rebuild", "clean", "test", "sdk"],
                     help="what to do (default: build)")
     ap.add_argument("--debug", action="store_true",
                     help="-O0 -g build (default: -O2 -DNDEBUG)")
@@ -416,6 +503,8 @@ def main():
         return 0 if m.clean() else 1
     if args.command == "test":
         return 0 if m.test() else 1
+    if args.command == "sdk":
+        return 0 if m.sdk() else 1
     return 1
 
 

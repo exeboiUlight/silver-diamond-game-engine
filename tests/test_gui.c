@@ -15,6 +15,8 @@
 #include "subjects/2D/gui/div.h"
 #include "subjects/2D/gui/button.h"
 #include "subjects/2D/gui/input.h"
+#include "subjects/2D/gui/slider.h"
+#include "subjects/2D/gui/radio.h"
 #include "subjects/2D/Camera.h"
 #include "scene/scene.h"
 #include "graphics/window.h"
@@ -90,7 +92,8 @@ static void test_scenes(void) {
 
 /* ----------------------------------------------------------- gui tests */
 
-static int g_clicks, g_changes, g_widget_events;
+static int g_clicks, g_changes, g_widget_events, g_radio_index, g_slider_changes;
+static float g_slider_value;
 static char g_last_text[128];
 
 static void on_click(void *user) {
@@ -102,6 +105,17 @@ static void on_change(void *user, const char *text) {
     (void)user;
     g_changes++;
     snprintf(g_last_text, sizeof(g_last_text), "%s", text ? text : "");
+}
+
+static void on_radio_change(void *user, int index) {
+    (void)user;
+    g_radio_index = index;
+}
+
+static void on_slider_change(void *user, float value) {
+    (void)user;
+    g_slider_value = value;
+    g_slider_changes++;
 }
 
 static void widget_event(sdge_gui *gui, sdge_widget *w, int type, int param) {
@@ -208,6 +222,33 @@ static void test_gui(void) {
         sdge_gui_mouse_button(g2, 0, SDGE_PRESS);
         sdge_gui_mouse_button(g2, 0, SDGE_RELEASE);
         CHECK(g_widget_events > 0, "gui: a custom widget gets the events");
+        sdge_gui_destroy(g2);
+    }
+
+    /* the slider tracks drag input and the radio group keeps one selection */
+    {
+        sdge_gui *g2 = sdge_gui_create();
+        sdge_gui_slider slider;
+        sdge_gui_radio_group group;
+        sdge_gui_radio r0, r1;
+        sdge_gui_radio_group_init(&group);
+        group.on_change = on_radio_change;
+        sdge_gui_slider_init(&slider, 0.0f, 0.0f, 100.0f, 22.0f, 0.1f);
+        slider.on_change = on_slider_change;
+        sdge_gui_radio_init(&r0, 0.0f, 40.0f, 16.0f, 0, &group);
+        sdge_gui_radio_init(&r1, 30.0f, 40.0f, 16.0f, 1, &group);
+        CHECK(sdge_gui_add(g2, &slider.base) == 0, "gui: add a slider");
+        CHECK(sdge_gui_add(g2, &r0.base) == 1, "gui: add the first radio");
+        CHECK(sdge_gui_add(g2, &r1.base) == 2, "gui: add the second radio");
+        sdge_gui_mouse_move(g2, 50.0f, 11.0f);
+        sdge_gui_mouse_button(g2, 0, SDGE_PRESS);
+        sdge_gui_mouse_button(g2, 0, SDGE_RELEASE);
+        CHECK(slider.value > 0.1f, "gui: the slider reacts to pointer drag");
+        sdge_gui_mouse_move(g2, 40.0f, 50.0f);
+        sdge_gui_mouse_button(g2, 0, SDGE_PRESS);
+        sdge_gui_mouse_button(g2, 0, SDGE_RELEASE);
+        CHECK(g_radio_index == 1, "gui: selecting a radio updates the group");
+        CHECK(r0.selected == 0 && r1.selected == 1, "gui: only one radio remains selected");
         sdge_gui_destroy(g2);
     }
 

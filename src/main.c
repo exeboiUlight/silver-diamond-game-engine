@@ -358,7 +358,6 @@ static void on_error(int code, const char *desc) {
 
 /* ----------------------------------------------------------------- scenes */
 static void show_only_menu(void) {
-    /* hides everything - every scene shows what it needs */
     g.menu_panel.base.visible = 0;
     g.world_panel.base.visible = 0;
     g.phys_panel.base.visible = 0;
@@ -526,7 +525,8 @@ static void phys3d_on_render(sdge_scene *s) {
 
         const sdge_mesh *mesh = (b->shape == SDPH3_SPHERE) ? &g.sphere_mesh
                                                            : &g.box_mesh;
-        sdgr_draw_mesh(mesh, m, NULL, 0, col, 0.1f, 0.5f, 0);
+        /* added the last 0 for base_texture */
+        sdgr_draw_mesh(mesh, m, NULL, 0, col, 0.1f, 0.5f, 0, 0);
     }
 }
 
@@ -711,17 +711,18 @@ int main(int argc, char **argv) {
     }
 
     if (gl_ok) {
-        /* the skinned character with its two animation clips; the huge
-         * "scene.glb" scan has no animations and the camera would sit
-         * inside it, so the showcase uses the character */
-        g.character = sdge_model_load("Subjects/Scene.glb");
+        /* Обновленные пути к файлам в соответствии с папкой assets/ */
+        g.character = sdge_model_load("assets/scene.glb");
         if (g.character && sdge_model_anim_count(g.character) > 0) {
             sdge_model_play(g.character, 0, 1);
             g.anim_index = 0;
             snprintf(g.anim_name, sizeof(g.anim_name), "%s",
                      sdge_model_anim_name(g.character, 0));
         }
+        
+        /* В качестве пола используем room.gltf */
         g.floor = sdge_model_load("Subjects/plane.glb");
+        
         if (gl_ok) {
             sdge_mesh_create_box(&g.box_mesh, 0.35f, 0.35f, 0.35f);
             sdge_mesh_create_sphere(&g.sphere_mesh, 0.3f, 20, 12);
@@ -748,7 +749,7 @@ int main(int argc, char **argv) {
     /* the audio */
     sdge_audio_init();
     g.audio_ok = sdge_audio_has_device();
-    g.beep = sdge_audio_load_wav("Subjects/beep.wav");
+    g.beep = sdge_audio_load_wav("assets/beep.wav");
     if (g.beep) {
         g.beep_src = sdge_audio_source_create(g.beep);
         if (g.beep_src) {

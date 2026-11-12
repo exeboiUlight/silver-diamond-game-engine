@@ -12,9 +12,12 @@
 extern "C" {
 #endif
 
+struct sdge_gui_radio;
+
 typedef struct sdge_gui_radio_group {
     int selected;            /* the index of the selected button */
     int count;
+    struct sdge_gui_radio *items[SDGE_GUI_MAX_WIDGETS];
     void (*on_change)(void *user, int index);
     void *user;
 } sdge_gui_radio_group;

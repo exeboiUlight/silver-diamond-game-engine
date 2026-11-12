@@ -61,7 +61,7 @@ static void test_primitives(sdge_window *win) {
             sdgr_resize(W, H);
             sdgr_begin_frame((const float[]){ 0.0f, 0.0f, 0.0f, 1.0f });
             sdgr_set_camera(id, id, (const float[3]){ 0.0f, 0.0f, 3.0f });
-            sdgr_draw_mesh(m, NULL, NULL, 0, white, 0.0f, 0.5f, 0);
+            sdgr_draw_mesh(m, NULL, NULL, 0, white, 0.0f, 0.5f, 0, 0);
             if (f == 1) {
                 glPixelStorei(GL_PACK_ALIGNMENT, 1);
                 glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
@@ -130,7 +130,7 @@ int main(void) {
         sdgr_resize(W, H);
         sdgr_begin_frame(clear);
         sdgr_set_camera(id, id, (const float[3]){ 0.0f, 0.0f, 5.0f });
-        sdgr_draw_mesh(&mesh, NULL, NULL, 0, NULL, 0.0f, 0.6f, 0);
+        sdgr_draw_mesh(&mesh, NULL, NULL, 0, NULL, 0.0f, 0.6f, 0, 0);
         if (f == 1) {
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
@@ -174,7 +174,7 @@ int main(void) {
                 sdgr_resize(W, H);
                 sdgr_begin_frame(clear);
                 sdgr_set_camera(view, proj, (const float[3]){ 0.0f, 1.1f, 3.0f });
-                sdgr_draw_mesh(&cm, NULL, NULL, 0, NULL, 0.0f, 0.6f, 0);
+                sdgr_draw_mesh(&cm, NULL, NULL, 0, NULL, 0.0f, 0.6f, 0, 0);
                 if (f == 1) {
                     glPixelStorei(GL_PACK_ALIGNMENT, 1);
                     glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);

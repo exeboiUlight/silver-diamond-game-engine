@@ -47,6 +47,7 @@ static void button_event(sdge_gui *gui, sdge_widget *w, int type, int param) {
     switch (type) {
     case SDGE_WIDGET_HOVER:   b->hovered = 1; break;
     case SDGE_WIDGET_UNHOVER: b->hovered = 0; b->active = 0; break;
+    case SDGE_WIDGET_PRESS:   if (b->base.enabled) b->active = 1; break;
     case SDGE_WIDGET_CLICK:
         b->active = 0;
         if (b->base.enabled && b->on_click) b->on_click(b->user);

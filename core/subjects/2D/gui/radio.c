@@ -3,6 +3,13 @@
 
 #include <string.h>
 
+static void radio_group_sync(sdge_gui_radio_group *g, int selected) {
+    if (!g) return;
+    for (int i = 0; i < g->count; ++i) {
+        if (g->items[i]) g->items[i]->selected = (g->items[i]->index == selected);
+    }
+}
+
 static void radio_draw(sdge_gui *gui, sdge_widget *w) {
     sdge_gui_radio *r = (sdge_gui_radio *)w;
     if (!r) return;
@@ -32,6 +39,7 @@ static void radio_event(sdge_gui *gui, sdge_widget *w, int type, int param) {
     if (r->group) {
         if (r->group->selected != r->index) {
             r->group->selected = r->index;
+            radio_group_sync(r->group, r->index);
             if (r->group->on_change) r->group->on_change(r->group->user,
                                                          r->index);
         }
@@ -68,7 +76,9 @@ SDGE_API void sdge_gui_radio_init(sdge_gui_radio *r, float x, float y, float siz
         memcpy(r->border_color, border, sizeof(border));
     }
     if (group) {
-        group->count++;
+        if (group->count >= SDGE_GUI_MAX_WIDGETS) return;
+        group->items[group->count++] = r;
+        r->selected = (group->selected == index);
         if (group->selected < 0) {
             group->selected = index;
             r->selected = 1;
@@ -79,4 +89,5 @@ SDGE_API void sdge_gui_radio_init(sdge_gui_radio *r, float x, float y, float siz
 void sdge_gui_radio_select(sdge_gui_radio_group *g, int index) {
     if (!g) return;
     g->selected = index;
+    radio_group_sync(g, index);
 }

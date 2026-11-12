@@ -8,6 +8,7 @@
  *   - 3D math           math/math3d.h       (vec/quat/mat, frustum)
  *   - assets            assets/assets.h     (arena, files, WAV)
  *   - glTF 2.0 loader   assets/gltf.h       (.glb / .gltf+.bin)
+ *   - images + fonts    assets/texture.h, assets/font.h
  *   - animation+skin    anim/anim.h         (sampling, joint palettes)
  *   - spatial audio     audio/audio.h       (48 kHz mixer, waveOut/ALSA)
  *   - renderer          graphics/renderer.h (GL 3.3+, PBR-lite)
@@ -37,6 +38,8 @@
 #include "assets/assets.h"
 #include "assets/gltf.h"
 #include "assets/mp3.h"
+#include "assets/font.h"
+#include "assets/texture.h"
 
 #include "anim/anim.h"
 

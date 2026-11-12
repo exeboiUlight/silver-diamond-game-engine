@@ -13,10 +13,8 @@
 
 #include <glad/glad.h>
 
-/* stringified joint limit (C preprocessor cannot glue numbers into strings) */
 #define SDGR_MAX_JOINTS_STR "128"
 
-/* identity matrix used when the caller passes NULL for `model` */
 static const float *r_identity(void) {
     static float m[16];
     static int init = 0;
@@ -34,10 +32,13 @@ static const char *R_VS =
 "layout(location=1) in vec3 aNrm;\n"
 "layout(location=2) in vec4 aJoint;\n"
 "layout(location=3) in vec4 aWeight;\n"
+"layout(location=4) in vec2 aUV;\n"
 "uniform mat4 uProj, uView, uModel;\n"
-"uniform mat4 uJoints[" SDGR_MAX_JOINTS_STR "];\n""uniform int uSkinned;\n"
+"uniform mat4 uJoints[" SDGR_MAX_JOINTS_STR "];\n"
+"uniform int uSkinned;\n"
 "out vec3 vN;\n"
 "out vec3 vWpos;\n"
+"out vec2 vUV;\n"
 "void main() {\n"
 "    mat4 skin = mat4(1.0);\n"
 "    if (uSkinned == 1) {\n"
@@ -49,6 +50,7 @@ static const char *R_VS =
 "    vec4 world = uModel * skin * vec4(aPos, 1.0);\n"
 "    vWpos = world.xyz;\n"
 "    vN = mat3(uModel) * mat3(skin) * aNrm;\n"
+"    vUV = aUV;\n"
 "    gl_Position = uProj * uView * world;\n"
 "}\n";
 
@@ -56,12 +58,15 @@ static const char *R_FS =
 "#version 330 core\n"
 "in vec3 vN;\n"
 "in vec3 vWpos;\n"
+"in vec2 vUV;\n"
+"uniform sampler2D uBaseTex;\n"
+"uniform int uHasTex;\n"
 "uniform vec3 uCamPos;\n"
 "uniform vec3 uAmbient;\n"
 "uniform vec3 uSunDir, uSunColor;\n"
 "uniform float uSunI;\n"
-"uniform vec4 uPointPos[" "8" "];\n"     /* xyz pos, w radius */
-"uniform vec4 uPointCol[" "8" "];\n"     /* rgb color, w intensity */
+"uniform vec4 uPointPos[" "8" "];\n"
+"uniform vec4 uPointCol[" "8" "];\n"
 "uniform int uPointCount;\n"
 "uniform vec4 uBaseColor;\n"
 "uniform float uMetallic, uRoughness;\n"
@@ -73,14 +78,16 @@ static const char *R_FS =
 "    return a2 / (3.14159265 * d * d);\n"
 "}\n"
 "void main() {\n"
+"    vec4 base = uBaseColor;\n"
+"    if (uHasTex == 1) base *= texture(uBaseTex, vUV);\n"
+"    if (base.a <= 0.002) discard;\n"
 "    vec3 N = normalize(vN);\n"
 "    if (uDoubleSided == 1 && !gl_FrontFacing) N = -N;\n"
 "    vec3 V = normalize(uCamPos - vWpos);\n"
-"    vec3 diffuse = uBaseColor.rgb * (1.0 - uMetallic);\n"
-"    vec3 f0 = mix(vec3(0.04), uBaseColor.rgb, uMetallic);\n"
+"    vec3 diffuse = base.rgb * (1.0 - uMetallic);\n"
+"    vec3 f0 = mix(vec3(0.04), base.rgb, uMetallic);\n"
 "    float a = uRoughness * uRoughness + 1e-3;\n"
-"    vec3 col = uAmbient * uBaseColor.rgb;\n"
-"    /* sun (directional) */\n"
+"    vec3 col = uAmbient * base.rgb;\n"
 "    if (uSunI > 0.0) {\n"
 "        vec3 L = normalize(-uSunDir);\n"
 "        float ndl = max(dot(N, L), 0.0);\n"
@@ -88,7 +95,6 @@ static const char *R_FS =
 "        float spec = ggx(max(dot(N, H), 0.0), a);\n"
 "        col += uSunColor * uSunI * ndl * (diffuse + f0 * spec);\n"
 "    }\n"
-"    /* point lights */\n"
 "    for (int i = 0; i < uPointCount; ++i) {\n"
 "        vec3 d = uPointPos[i].xyz - vWpos;\n"
 "        float dist = length(d) + 1e-4;\n"
@@ -102,7 +108,7 @@ static const char *R_FS =
 "        col += uPointCol[i].rgb * uPointCol[i].w * att * ndl\n"
 "             * (diffuse + f0 * spec);\n"
 "    }\n"
-"    frag = vec4(col, uBaseColor.a);\n"
+"    frag = vec4(col, base.a);\n"
 "}\n";
 
 typedef struct {
@@ -111,6 +117,7 @@ typedef struct {
     int loc_cam, loc_ambient, loc_sundir, loc_suncol, loc_suni;
     int loc_ppos, loc_pcol, loc_pcount;
     int loc_base, loc_metal, loc_rough, loc_dbl;
+    int loc_base_tex, loc_has_tex;
 
     float view[16], proj[16], cam_pos[3];
     float frustum[6][4];
@@ -179,18 +186,16 @@ SDGE_API int sdgr_init(void) {
     g_r.loc_sundir  = glGetUniformLocation(prog, "uSunDir");
     g_r.loc_suncol  = glGetUniformLocation(prog, "uSunColor");
     g_r.loc_suni    = glGetUniformLocation(prog, "uSunI");
-    g_r.loc_ppos    = glGetUniformLocation(prog, "uPointPos");
-    g_r.loc_pcol    = glGetUniformLocation(prog, "uPointCol");
+    g_r.loc_ppos    = glGetUniformLocation(prog, "uPointPos[0]");
+    g_r.loc_pcol    = glGetUniformLocation(prog, "uPointCol[0]");
     g_r.loc_pcount  = glGetUniformLocation(prog, "uPointCount");
     g_r.loc_base    = glGetUniformLocation(prog, "uBaseColor");
     g_r.loc_metal   = glGetUniformLocation(prog, "uMetallic");
     g_r.loc_rough   = glGetUniformLocation(prog, "uRoughness");
     g_r.loc_dbl     = glGetUniformLocation(prog, "uDoubleSided");
+    g_r.loc_base_tex= glGetUniformLocation(prog, "uBaseTex");
+    g_r.loc_has_tex = glGetUniformLocation(prog, "uHasTex");
 
-    /* neutral scene defaults
-     * NOTE: g_r_inited must be set BEFORE the setters below - they bail out
-     * early while the renderer is still uninitialised, which left the
-     * ambient/sun uniforms at zero (everything rendered black). */
     m4_identity(g_r.view);
     m4_identity(g_r.proj);
     g_r.point_count = 0;
@@ -227,10 +232,12 @@ SDGE_API void sdgr_begin_frame(const float clear_color[4]) {
     glClearColor(c[0], c[1], c[2], c[3]);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glUseProgram(g_r.prog);
+    g_r.point_count = 0;
+    glUniform1i(g_r.loc_pcount, 0);
+    if (g_r.loc_has_tex >= 0) glUniform1i(g_r.loc_has_tex, 0);
 }
 
 SDGE_API void sdgr_end_frame(void) {
-    /* state left bound; swap happens in the window layer */
 }
 
 SDGE_API void sdgr_set_camera(const sdg_mat4 view, const sdg_mat4 proj,
@@ -280,7 +287,7 @@ SDGE_API void sdgr_set_point_light(int index, const float pos[3],
     c[0] = color ? color[0] : 1; c[1] = color ? color[1] : 1;
     c[2] = color ? color[2] : 1; c[3] = intensity;
     glUseProgram(g_r.prog);
-    glUniform4fv(g_r.loc_ppos + index, 1, p);   /* arrays: consecutive locs */
+    glUniform4fv(g_r.loc_ppos + index, 1, p);
     glUniform4fv(g_r.loc_pcol + index, 1, c);
     if (index + 1 > g_r.point_count) {
         g_r.point_count = index + 1;
@@ -288,14 +295,38 @@ SDGE_API void sdgr_set_point_light(int index, const float pos[3],
     }
 }
 
+SDGE_API unsigned sdgr_upload_texture(int w, int h,
+                                       const unsigned char *rgba8) {
+    if (!g_r_inited || !rgba8 || w <= 0 || h <= 0) return 0;
+    unsigned tex = 0;
+    glGenTextures(1, &tex);
+    if (!tex) return 0;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba8);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    return tex;
+}
+
+SDGE_API void sdgr_free_texture(unsigned tex) {
+    if (tex) glDeleteTextures(1, &tex);
+}
+
 SDGE_API void sdgr_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
                              const float *joints, int joint_count,
                              const float base_color[4],
-                             float metallic, float roughness, int double_sided) {
+                             float metallic, float roughness, int double_sided,
+                             unsigned base_texture) {
     if (!g_r_inited || !mesh || !mesh->vao) return;
 
     int skinned = (mesh->has_skin && joints && joint_count > 0);
     if (skinned && joint_count > SDGR_MAX_JOINTS) joint_count = SDGR_MAX_JOINTS;
+    int use_tex = (base_texture != 0 && mesh->has_texcoords);
 
     glUseProgram(g_r.prog);
     glUniformMatrix4fv(g_r.loc_proj, 1, GL_FALSE, g_r.proj);
@@ -314,6 +345,13 @@ SDGE_API void sdgr_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
     glUniform1f(g_r.loc_rough, roughness < 0.045f ? 0.045f : roughness);
     glUniform1i(g_r.loc_dbl, (double_sided || mesh->double_sided) ? 1 : 0);
 
+    if (g_r.loc_has_tex >= 0) glUniform1i(g_r.loc_has_tex, use_tex ? 1 : 0);
+    if (g_r.loc_base_tex >= 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, use_tex ? base_texture : 0);
+        glUniform1i(g_r.loc_base_tex, 0);
+    }
+
     if (double_sided || mesh->double_sided) glDisable(GL_CULL_FACE);
 
     glBindVertexArray(mesh->vao);
@@ -325,13 +363,15 @@ SDGE_API void sdgr_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
         glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
     }
 
-    {   /* GL errors are fatal for the frame - report the first one */
+#ifndef NDEBUG
+    {
         GLenum e = glGetError();
         if (e != GL_NO_ERROR) {
             fprintf(stderr, "renderer: GL error 0x%x while drawing\n",
                     (unsigned)e);
         }
     }
+#endif
     glBindVertexArray(0);
 
     if (double_sided || mesh->double_sided) glEnable(GL_CULL_FACE);
@@ -344,7 +384,6 @@ SDGE_API int sdgr_screenshot(const char *path) {
     int w = vp[2], h = vp[3];
     if (w <= 0 || h <= 0) return -2;
 
-    /* read rows bottom-up and write them last-to-first (PPM is top-down) */
     unsigned char *row = (unsigned char *)malloc((size_t)w * 3u);
     if (!row) return -3;
 
@@ -376,10 +415,17 @@ SDGE_API void sdgr_set_ambient(float r, float g, float b) { (void)r; (void)g; (v
 SDGE_API void sdgr_set_sun(const float d[3], const float c[3], float i) { (void)d; (void)c; (void)i; }
 SDGE_API void sdgr_set_point_light(int i, const float p[3], const float c[3],
                                     float in, float r) { (void)i; (void)p; (void)c; (void)in; (void)r; }
+SDGE_API unsigned sdgr_upload_texture(int w, int h,
+                                       const unsigned char *rgba8) {
+    (void)w; (void)h; (void)rgba8; return 0;
+}
+SDGE_API void sdgr_free_texture(unsigned tex) { (void)tex; }
 SDGE_API void sdgr_draw_mesh(const sdge_mesh *m, const sdg_mat4 mo,
                              const float *j, int jc, const float bc[4],
-                             float me, float ro, int ds) {
-    (void)m; (void)mo; (void)j; (void)jc; (void)bc; (void)me; (void)ro; (void)ds;
+                             float me, float ro, int ds, unsigned bt) {
+    (void)m; (void)mo; (void)j; (void)jc; (void)bc; (void)me; (void)ro;
+    (void)ds; (void)bt;
 }
+SDGE_API int sdgr_screenshot(const char *p) { (void)p; return -1; }
 
 #endif /* SDGE_NO_GL */

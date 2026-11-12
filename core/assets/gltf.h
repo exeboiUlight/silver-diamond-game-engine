@@ -8,9 +8,10 @@
  *   - one free call releases the whole model (arena blocks).
  *
  * Supported: nodes (TRS + matrix), meshes/primitives, skins (inverse bind
- * matrices), animations (LINEAR/STEP/CUBICSPLINE on T/R/S), PBR factors.
+ * matrices), animations (LINEAR/STEP/CUBICSPLINE on T/R/S), PBR factors,
+ * baseColorTexture (images/textures/samplers, external files + GLB bufferViews).
  * Not supported (v1): morph targets (WEIGHTS), sparse accessors, Draco,
- * base64 data-URIs, textures (hook up an image loader + sdgr_texture later).
+ * base64 data-URIs, PBR texture channels beyond baseColor.
  */
 #ifndef SDGE_GLTF_H
 #define SDGE_GLTF_H
@@ -42,6 +43,14 @@ typedef struct {
     float bounds_min[3];
     float bounds_max[3];
 } sdge_accessor;
+
+/* NEW: a raw slice of the binary chunk (used by embedded images) */
+typedef struct {
+    const unsigned char *data;
+    int byte_length;
+    int byte_offset;
+    int byte_stride;    /* 0 = tightly packed */
+} sdge_gltf_buffer_view;
 
 typedef struct {
     sdge_accessor positions;
@@ -103,12 +112,34 @@ typedef struct {
     float duration;             /* seconds (max key time) */
 } sdge_gltf_animation;
 
+/* NEW: image / texture / sampler */
+typedef struct {
+    char *name;
+    char *uri;                  /* external file; NULL for GLB images */
+    int   buffer_view;          /* glTF image.bufferView, -1 if none */
+    char *mime_type;            /* "image/png", "image/jpeg", NULL */
+} sdge_gltf_image;
+
+typedef struct {
+    int source;                 /* index into images, -1 if none */
+    int sampler;                /* index into samplers, -1 if default */
+} sdge_gltf_texture;
+
+typedef struct {
+    int mag_filter;             /* GL constant, 0 = default */
+    int min_filter;
+    int wrap_s, wrap_t;
+} sdge_gltf_sampler;
+
 typedef struct {
     char *name;
     float base_color[4];
     float metallic;
     float roughness;
     int double_sided;
+    /* NEW: */
+    int base_color_texture;     /* index into textures, -1 = none */
+    int base_color_texcoord;    /* TEXCOORD_n, usually 0 */
 } sdge_gltf_material;
 
 typedef struct {
@@ -118,6 +149,13 @@ typedef struct {
     sdge_gltf_skin *skins;     int skin_count;
     sdge_gltf_animation *anims; int anim_count;
     sdge_gltf_material *materials; int material_count;
+
+    /* NEW */
+    sdge_gltf_buffer_view *buffer_views; int buffer_view_count;
+    sdge_gltf_image   *images;     int image_count;
+    sdge_gltf_texture *textures;   int texture_count;
+    sdge_gltf_sampler *samplers;   int sampler_count;
+
     sdga_arena arena;          /* owns all memory above */
 } sdge_gltf_model;
 
@@ -195,7 +233,7 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     int ctype    = (int)sdj_num(d, sdj_obj_get(d, acc, "componentType"));
     int off      = (int)sdj_num(d, sdj_obj_get(d, acc, "byteOffset"));
     char tbuf[16];
-    tbuf[0] = '\0';                       /* a missing type must not be read */
+    tbuf[0] = '\0';
     int type_tok = sdj_obj_get(d, acc, "type");
     if (type_tok >= 0)
         sdj_str(d, type_tok, tbuf, (int)sizeof(tbuf));
@@ -205,13 +243,12 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
         int n = sdj_obj_get(d, acc, "normalized");
         if (n >= 0) {
             const sdj_token *k = &d->tok[n];
-            normalized = (d->src[k->start] == 't');   /* "true" */
+            normalized = (d->src[k->start] == 't');
         }
     }
     if (count <= 0 || comps == 0 || g_ctype_size(ctype) == 0)
         return -2;
 
-    /* bufferView (may be absent only for sparse accessors - unsupported) */
     size_t view_off = 0;
     int stride = 0;
     const unsigned char *base = NULL;
@@ -223,7 +260,7 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
         view_off = (size_t)sdj_num(d, sdj_obj_get(d, vt, "byteOffset"));
         stride   = (int)sdj_num(d, sdj_obj_get(d, vt, "byteStride"));
         int buffer_idx = (int)sdj_num(d, sdj_obj_get(d, vt, "buffer"));
-        if (buffer_idx != 0) return -4;                /* only buffer 0 */
+        if (buffer_idx != 0) return -4;
         base = bufs->bin;
         if (!base) return -5;
     } else {
@@ -237,7 +274,7 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     if (count > 0
         && (size_t)(data - base) + (size_t)(count - 1) * (size_t)stride
                + (size_t)(comps * csz) > bufs->bin_len)
-        return -8;                                     /* out of buffer */
+        return -8;
 
     out->data = data;
     out->count = count;
@@ -246,7 +283,6 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     out->stride = stride;
     out->normalized = normalized;
 
-    /* min/max (used for POSITION bounds) */
     int mn = sdj_obj_get(d, acc, "min");
     int mx = sdj_obj_get(d, acc, "max");
     for (int i = 0; i < 3; ++i) {
@@ -256,7 +292,6 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     return 0;
 }
 
-/* copy an accessor's data to float32 (for animation/skin tracks) */
 static float *g_accessor_to_f32(sdge_gltf_model *m, const sdge_accessor *a) {
     int n = a->count * a->comps;
     float *out = (float *)sdga_alloc(&m->arena, sizeof(float) * (size_t)n);
@@ -283,20 +318,18 @@ SDGE_API void sdge_gltf_destroy(sdge_gltf_model *m) {
     free(m);
 }
 
-/* resolve the binary buffer for .gltf: buffer[0].uri -> sibling .bin file */
 static int g_load_buffer0(sdj_doc *d, const char *gltf_path,
                           sdge_gltf_model *m, g_buffers *bufs) {
     int bufs_tok = sdj_obj_get(d, 0, "buffers");
     int b0 = sdj_arr_at(d, bufs_tok, 0);
     if (b0 < 0) return -1;
     int uri = sdj_obj_get(d, b0, "uri");
-    if (uri < 0) return -2;                  /* GLB handles bin via chunk */
+    if (uri < 0) return -2;
 
     char ubuf[512];
     if (sdj_str(d, uri, ubuf, (int)sizeof(ubuf)) < 0) return -3;
-    if (!strncmp(ubuf, "data:", 5)) return -4;   /* base64 not supported */
+    if (!strncmp(ubuf, "data:", 5)) return -4;
 
-    /* relative to the .gltf file's directory */
     char path[1024];
     const char *slash = strrchr(gltf_path, '/');
     const char *bslash = strrchr(gltf_path, '\\');
@@ -366,12 +399,10 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                 bufs.bin = bin;
                 bufs.bin_len = clen;
             }
-            pos += 8 + clen + ((clen & 3) ? (4 - (clen & 3)) : 0);  /* 4B aligned */
+            pos += 8 + clen + ((clen & 3) ? (4 - (clen & 3)) : 0);
         }
         if (!have_json) goto fail;
     } else {
-        /* text .gltf: the external .bin buffer is resolved AFTER the JSON is
-         * parsed (the uri text lives inside the json document) */
         char *text = (char *)sdga_alloc(&m->arena, file_size + 1);
         if (!text) goto fail;
         memcpy(text, file, file_size);
@@ -392,7 +423,6 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
         goto fail;
     }
 
-    /* required extensions are a hard stop (Draco etc.) */
     {
         int ext = sdj_obj_get(&doc, 0, "extensionsRequired");
         if (sdj_len(&doc, ext) > 0) {
@@ -402,11 +432,36 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
         }
     }
 
-    /* .gltf: resolve buffer 0 now that the doc is parsed (needs uri text) */
     if (!is_glb && !bufs.bin) {
         if (g_load_buffer0(&doc, path, m, &bufs) != 0) {
-            /* no buffer: model without binary data - meshes will fail,
-             * animations too; keep going so node counts still load */
+            /* model without binary data - keep going */
+        }
+    }
+
+    /* ---- NEW: bufferViews (needed for embedded images) ---- */
+    {
+        int arr = sdj_obj_get(&doc, 0, "bufferViews");
+        m->buffer_view_count = sdj_len(&doc, arr);
+        if (m->buffer_view_count > 0) {
+            m->buffer_views = (sdge_gltf_buffer_view *)sdga_alloc(&m->arena,
+                sizeof(sdge_gltf_buffer_view) * (size_t)m->buffer_view_count);
+            if (!m->buffer_views) { free(toks); goto fail; }
+            memset(m->buffer_views, 0,
+                   sizeof(sdge_gltf_buffer_view) * (size_t)m->buffer_view_count);
+            for (int i = 0; i < m->buffer_view_count; ++i) {
+                int vt = sdj_arr_at(&doc, arr, i);
+                int off = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "byteOffset"));
+                int len = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "byteLength"));
+                int stride = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "byteStride"));
+                int buf_idx = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "buffer"));
+                if (buf_idx != 0 || !bufs.bin) continue;
+                if (off < 0 || len <= 0) continue;
+                if ((size_t)off + (size_t)len > bufs.bin_len) continue;
+                m->buffer_views[i].data = bufs.bin + off;
+                m->buffer_views[i].byte_length = len;
+                m->buffer_views[i].byte_offset = off;
+                m->buffer_views[i].byte_stride = stride;
+            }
         }
     }
 
@@ -437,10 +492,6 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                     n->matrix[k] = (float)sdj_num(&doc, sdj_arr_at(&doc, mat, k));
                 n->has_matrix = 1;
             } else {
-                /* glTF: a missing component keeps its default
-                 * (translation 0, rotation identity, scale 1). Reading a
-                 * missing key gave 0 -> a zero scale collapsed the whole
-                 * model into a point. */
                 int t = sdj_obj_get(&doc, nt, "translation");
                 int r = sdj_obj_get(&doc, nt, "rotation");
                 int s = sdj_obj_get(&doc, nt, "scale");
@@ -473,7 +524,6 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                     n->children[k] = (int)sdj_num(&doc, sdj_arr_at(&doc, ch, k));
             }
         }
-        /* fill parents via children lists */
         for (int i = 0; i < m->node_count; ++i)
             for (int k = 0; k < m->nodes[i].child_count; ++k) {
                 int c = m->nodes[i].children[k];
@@ -489,7 +539,6 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
         int roots_tok = sdj_obj_get(&doc, st, "nodes");
         m->root_count = sdj_len(&doc, roots_tok);
         if (m->root_count <= 0) {
-            /* fallback: every parentless node */
             for (int i = 0; i < m->node_count; ++i)
                 if (m->nodes[i].parent < 0) m->root_count++;
         }
@@ -662,7 +711,7 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                 if      (!strcmp(pbuf, "translation")) ch->path = SDGE_ANIM_T;
                 else if (!strcmp(pbuf, "rotation"))   ch->path = SDGE_ANIM_R;
                 else if (!strcmp(pbuf, "scale"))      ch->path = SDGE_ANIM_S;
-                else ch->path = SDGE_ANIM_W;          /* weights: unsupported */
+                else ch->path = SDGE_ANIM_W;
 
                 int sidx = (int)sdj_num(&doc, sdj_obj_get(&doc, ct, "sampler"));
                 int smp = sdj_arr_at(&doc, samplers, sidx);
@@ -693,6 +742,69 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
         }
     }
 
+    /* ---- NEW: images / textures / samplers ---- */
+    {
+        int arr = sdj_obj_get(&doc, 0, "images");
+        m->image_count = sdj_len(&doc, arr);
+        if (m->image_count > 0) {
+            m->images = (sdge_gltf_image *)sdga_alloc(&m->arena,
+                sizeof(sdge_gltf_image) * (size_t)m->image_count);
+            if (!m->images) { free(toks); goto fail; }
+            memset(m->images, 0, sizeof(sdge_gltf_image) * (size_t)m->image_count);
+            for (int i = 0; i < m->image_count; ++i) {
+                int it = sdj_arr_at(&doc, arr, i);
+                sdge_gltf_image *im = &m->images[i];
+                im->buffer_view = -1;
+                im->name = g_str(m, &doc, sdj_obj_get(&doc, it, "name"));
+                im->mime_type = g_str(m, &doc, sdj_obj_get(&doc, it, "mimeType"));
+                int bv = sdj_obj_get(&doc, it, "bufferView");
+                if (bv >= 0) im->buffer_view = (int)sdj_num(&doc, bv);
+                int uri = sdj_obj_get(&doc, it, "uri");
+                if (uri >= 0) im->uri = g_str(m, &doc, uri);
+            }
+        }
+    }
+    {
+        int arr = sdj_obj_get(&doc, 0, "textures");
+        m->texture_count = sdj_len(&doc, arr);
+        if (m->texture_count > 0) {
+            m->textures = (sdge_gltf_texture *)sdga_alloc(&m->arena,
+                sizeof(sdge_gltf_texture) * (size_t)m->texture_count);
+            if (!m->textures) { free(toks); goto fail; }
+            memset(m->textures, 0,
+                   sizeof(sdge_gltf_texture) * (size_t)m->texture_count);
+            for (int i = 0; i < m->texture_count; ++i) {
+                int tt = sdj_arr_at(&doc, arr, i);
+                sdge_gltf_texture *tx = &m->textures[i];
+                tx->source = -1;
+                tx->sampler = -1;
+                int s = sdj_obj_get(&doc, tt, "source");
+                if (s >= 0) tx->source = (int)sdj_num(&doc, s);
+                int sm = sdj_obj_get(&doc, tt, "sampler");
+                if (sm >= 0) tx->sampler = (int)sdj_num(&doc, sm);
+            }
+        }
+    }
+    {
+        int arr = sdj_obj_get(&doc, 0, "samplers");
+        m->sampler_count = sdj_len(&doc, arr);
+        if (m->sampler_count > 0) {
+            m->samplers = (sdge_gltf_sampler *)sdga_alloc(&m->arena,
+                sizeof(sdge_gltf_sampler) * (size_t)m->sampler_count);
+            if (!m->samplers) { free(toks); goto fail; }
+            memset(m->samplers, 0,
+                   sizeof(sdge_gltf_sampler) * (size_t)m->sampler_count);
+            for (int i = 0; i < m->sampler_count; ++i) {
+                int st = sdj_arr_at(&doc, arr, i);
+                sdge_gltf_sampler *sp = &m->samplers[i];
+                sp->mag_filter = (int)sdj_num(&doc, sdj_obj_get(&doc, st, "magFilter"));
+                sp->min_filter = (int)sdj_num(&doc, sdj_obj_get(&doc, st, "minFilter"));
+                sp->wrap_s = (int)sdj_num(&doc, sdj_obj_get(&doc, st, "wrapS"));
+                sp->wrap_t = (int)sdj_num(&doc, sdj_obj_get(&doc, st, "wrapT"));
+            }
+        }
+    }
+
     /* ---- materials ---- */
     {
         int arr = sdj_obj_get(&doc, 0, "materials");
@@ -708,11 +820,12 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
             int mt = sdj_arr_at(&doc, arr, i);
             sdge_gltf_material *mat = &m->materials[i];
             mat->name = g_str(m, &doc, sdj_obj_get(&doc, mt, "name"));
-            /* glTF 2.0 spec defaults */
             v4_set(mat->base_color, 1.0f, 1.0f, 1.0f, 1.0f);
             mat->metallic = 1.0f;
             mat->roughness = 1.0f;
             mat->double_sided = 0;
+            mat->base_color_texture = -1;
+            mat->base_color_texcoord = 0;
             int pbr = sdj_obj_get(&doc, mt, "pbrMetallicRoughness");
             int bc = sdj_obj_get(&doc, pbr, "baseColorFactor");
             if (sdj_len(&doc, bc) == 4)
@@ -725,6 +838,14 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
             if (rf >= 0) mat->roughness = (float)sdj_num(&doc, rf);
             int ds = sdj_obj_get(&doc, mt, "doubleSided");
             if (ds >= 0) mat->double_sided = (doc.src[doc.tok[ds].start] == 't');
+            int bct = sdj_obj_get(&doc, pbr, "baseColorTexture");
+            if (bct >= 0) {
+                int idx = (int)sdj_num(&doc, sdj_obj_get(&doc, bct, "index"));
+                int texcoord = (int)sdj_num(&doc, sdj_obj_get(&doc, bct, "texCoord"));
+                mat->base_color_texture = (idx >= 0 && idx < m->texture_count)
+                                        ? idx : -1;
+                mat->base_color_texcoord = texcoord >= 0 ? texcoord : 0;
+            }
         }
     }
 

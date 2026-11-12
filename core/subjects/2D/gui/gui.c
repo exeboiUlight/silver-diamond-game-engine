@@ -129,9 +129,11 @@ void sdge_gui_mouse_move(sdge_gui *g, float x, float y) {
 
 void sdge_gui_mouse_button(sdge_gui *g, int button, int action) {
     if (!g || button != 0) return;            /* left button only */
-    if (action == 1) {                        /* press */
+    if (action == 1) {                          /* press */
         g->pressed = gui_hit(g, g->mouse_x, g->mouse_y);
-    } else {                                  /* release */
+        if (g->pressed >= 0)
+            gui_event(g, g->pressed, SDGE_WIDGET_PRESS, 0);
+    } else if (action == 0) {                   /* release */
         int hit = gui_hit(g, g->mouse_x, g->mouse_y);
         if (g->pressed >= 0 && g->pressed == hit) {
             gui_event(g, hit, SDGE_WIDGET_CLICK, 0);

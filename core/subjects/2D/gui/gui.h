@@ -39,6 +39,7 @@ extern "C" {
 #define SDGE_WIDGET_FOCUS   6
 #define SDGE_WIDGET_BLUR    7
 #define SDGE_WIDGET_SCROLL  8      /* param = the scroll dy*100 */
+#define SDGE_WIDGET_PRESS   9      /* param = unused */
 
 typedef struct sdge_gui sdge_gui;
 
