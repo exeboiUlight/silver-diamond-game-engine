@@ -30,6 +30,9 @@ typedef struct {
  * 0 keeps RGB for opaque files (smaller uploads). */
 SDGE_API int  sdga_image_load(const char *path, sdga_image *out);
 SDGE_API int  sdga_image_load_rgba(const char *path, sdga_image *out);
+/* decodes an image that is already in memory (GLB bufferView, data-URI) */
+SDGE_API int  sdga_image_load_rgba_mem(const void *data, int size,
+                                       sdga_image *out);
 SDGE_API void sdga_image_free(sdga_image *img);
 
 #ifdef __cplusplus

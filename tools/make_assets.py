@@ -3,10 +3,9 @@
 
 Generates (deterministically, stdlib only):
   Subjects/cube.glb, sphere.glb, plane.glb, cylinder.glb, cone.glb,
-  torus.glb, character.glb (rigged, 2 animations), beep.wav
-  tests/data/triangle.gltf + triangle.bin   (external-buffer glTF)
-  tests/data/beep.wav                       (44.1 kHz -> exercises resampler)
-
+  torus.glb, character.glb (rigged, 2 animations), textured.glb (PBR
+  texture test: base color + metallic-roughness + normal + emissive),
+  beep.wav
 The generated character is a full skinning test: 17-bone skeleton, one
 skinned mesh (boxes weighted per bone), inverse bind matrices, and two
 animations ("idle" with a known hips-height curve, "wave").
@@ -17,6 +16,7 @@ import math
 import os
 import struct
 import sys
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -136,7 +136,7 @@ class Gltf:
         return self.acc(data, UNSIGNED_BYTE, atype, len(values) // comps)
 
     def build(self, nodes, meshes, skins=None, animations=None, materials=None,
-              scene_roots=None):
+              scene_roots=None, images=None, textures=None, samplers=None):
         doc = {
             "asset": {"version": "2.0", "generator": "sdge make_assets.py"},
             "scene": 0,
@@ -155,6 +155,12 @@ class Gltf:
             doc["animations"] = animations
         if materials:
             doc["materials"] = materials
+        if images:
+            doc["images"] = images
+        if textures:
+            doc["textures"] = textures
+        if samplers:
+            doc["samplers"] = samplers
 
         js = json.dumps(doc, separators=(",", ":")).encode("utf-8")
         while len(js) % 4:
@@ -500,6 +506,180 @@ def character_glb():
                    materials=[mat])
 
 
+# --------------------------------------------------------- textured model
+def png_rgb(width, height, pixels):
+    """encodes RGB8 pixels (bytearray, w*h*3) into a PNG file"""
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)                          # filter: none
+        raw += pixels[y * width * 3:(y + 1) * width * 3]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    out = b"\x89PNG\r\n\x1a\n"
+    out += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    out += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    out += chunk(b"IEND", b"")
+    return out
+
+
+def checker_png(size=256, cells=4):
+    """red/blue checkerboard - the base color map of the test cube"""
+    px = bytearray(size * size * 3)
+    for y in range(size):
+        for x in range(size):
+            cell = ((x * cells) // size + (y * cells) // size) & 1
+            i = (y * size + x) * 3
+            if cell:
+                px[i] = 235; px[i + 1] = 70;  px[i + 2] = 45
+            else:
+                px[i] = 35;  px[i + 1] = 90;  px[i + 2] = 225
+            # a thin white frame marks the texture border
+            edge = x < 2 or y < 2 or x >= size - 2 or y >= size - 2
+            if edge:
+                px[i] = px[i + 1] = px[i + 2] = 250
+    return png_rgb(size, size, px)
+
+
+def normal_png(size=256):
+    """a raised dome in the middle - shows the normal mapping clearly"""
+    px = bytearray(size * size * 3)
+    strength = 2.2
+    for y in range(size):
+        for x in range(size):
+            u = (x + 0.5) / size * 2.0 - 1.0
+            v = (y + 0.5) / size * 2.0 - 1.0
+            r2 = u * u + v * v
+            if r2 < 0.98:
+                z = math.sqrt(max(0.0, 1.0 - r2))
+                nx, ny, nz = u * strength, -v * strength, 1.0
+                l = math.sqrt(nx * nx + ny * ny + nz * nz)
+                nx, ny, nz = nx / l, ny / l, nz / l
+            else:
+                nx, ny, nz = 0.0, 0.0, 1.0
+            i = (y * size + x) * 3
+            px[i] = int((nx * 0.5 + 0.5) * 255)
+            px[i + 1] = int((ny * 0.5 + 0.5) * 255)
+            px[i + 2] = int((nz * 0.5 + 0.5) * 255)
+    return png_rgb(size, size, px)
+
+
+def mr_png(size=256):
+    """metallic (blue) = 0.9, roughness (green) = 0.25"""
+    px = bytearray(size * size * 3)
+    for i in range(size * size):
+        px[i * 3 + 0] = 255                     # (unused) occlusion/AO slot
+        px[i * 3 + 1] = 64                      # roughness 0.25
+        px[i * 3 + 2] = 230                     # metallic 0.9
+    return png_rgb(size, size, px)
+
+
+def emissive_png(size=256):
+    """a warm glow - the emissive map of the second cube"""
+    px = bytearray(size * size * 3)
+    for y in range(size):
+        for x in range(size):
+            i = (y * size + x) * 3
+            v = 255 if (x + y) % 64 < 32 else 40
+            px[i] = v
+            px[i + 1] = int(v * 0.55)
+            px[i + 2] = 30
+    return png_rgb(size, size, px)
+
+
+def textured_box(size=1.0):
+    """box with UVs and tangents (one UV set, CCW winding)"""
+    h = size * 0.5
+    faces = [
+        # (corner list, normal, tangent(u), bitangent(v))
+        ([(-h, -h, h), (h, -h, h), (h, h, h), (-h, h, h)],
+         (0, 0, 1), (1, 0, 0), (0, 1, 0)),
+        ([(h, -h, -h), (-h, -h, -h), (-h, h, -h), (h, h, -h)],
+         (0, 0, -1), (-1, 0, 0), (0, 1, 0)),
+        ([(h, -h, h), (h, -h, -h), (h, h, -h), (h, h, h)],
+         (1, 0, 0), (0, 0, -1), (0, 1, 0)),
+        ([(-h, -h, -h), (-h, -h, h), (-h, h, h), (-h, h, -h)],
+         (-1, 0, 0), (0, 0, 1), (0, 1, 0)),
+        ([(-h, h, h), (h, h, h), (h, h, -h), (-h, h, -h)],
+         (0, 1, 0), (1, 0, 0), (0, 0, -1)),
+        ([(-h, -h, -h), (h, -h, -h), (h, -h, h), (-h, -h, h)],
+         (0, -1, 0), (1, 0, 0), (0, 0, 1)),
+    ]
+    uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    pos, nrm, uv, tan, idx = [], [], [], [], []
+    for verts, n, t, b in faces:
+        base = len(pos)
+        for v in verts:
+            pos.append(v)
+            nrm.append(n)
+            tan.append((*t, 1.0))
+        uv.extend(uvs)
+        idx += [base, base + 1, base + 2, base, base + 2, base + 3]
+    return pos, nrm, uv, tan, idx
+
+
+def textured_cube_glb():
+    """two cubes that exercise the whole texture pipeline:
+       - left:  base color + metallic-roughness + normal map
+       - right: base color + emissive map, alphaMode BLEND"""
+    g = Gltf()
+
+    # the images live inside the GLB (bufferView + mimeType)
+    img_specs = [
+        ("checker", checker_png(), "image/png"),
+        ("normal", normal_png(), "image/png"),
+        ("mr", mr_png(), "image/png"),
+        ("emissive", emissive_png(), "image/png"),
+    ]
+    images = []
+    for name, data, mime in img_specs:
+        view = g.view(data)
+        images.append({"name": name, "mimeType": mime, "bufferView": view})
+    textures = [{"sampler": 0, "source": i} for i in range(len(images))]
+    samplers = [{"magFilter": 9729, "minFilter": 9987,
+                 "wrapS": 10497, "wrapT": 10497}]
+
+    meshes = []
+    for mesh_name, x_offset in (("pbr_cube", -0.75), ("glow_cube", 0.75)):
+        pos, nrm, uv, tan, idx = textured_box(1.0)
+        pos = [(p[0] + x_offset, p[1], p[2]) for p in pos]
+        a_pos = g.acc_f32(pos, "VEC3", *bounds(pos))
+        a_nrm = g.acc_f32(nrm, "VEC3")
+        a_uv = g.acc_f32(uv, "VEC2")
+        a_tan = g.acc_f32(tan, "VEC4")
+        a_idx = g.acc_u16(idx)
+        meshes.append({
+            "name": mesh_name,
+            "primitives": [{
+                "attributes": {"POSITION": a_pos, "NORMAL": a_nrm,
+                               "TEXCOORD_0": a_uv, "TANGENT": a_tan},
+                "indices": a_idx, "material": len(meshes), "mode": 4}]})
+
+    materials = [
+        {"name": "pbr",
+         "pbrMetallicRoughness": {
+             "baseColorTexture": {"index": 0},
+             "metallicRoughnessTexture": {"index": 1},
+             "metallicFactor": 1.0, "roughnessFactor": 1.0}},
+        {"name": "glow",
+         "alphaMode": "BLEND",
+         "emissiveFactor": [1.0, 0.6, 0.2],
+         "emissiveTexture": {"index": 3},
+         "pbrMetallicRoughness": {
+             "baseColorFactor": [0.4, 0.4, 0.45, 0.6],
+             "metallicFactor": 0.0, "roughnessFactor": 0.4}},
+    ]
+    for m in materials:
+        m["normalTexture"] = {"index": 2, "scale": 1.0}
+
+    nodes = [{"mesh": i, "name": m["name"]} for i, m in enumerate(meshes)]
+    return g.build(nodes, meshes, materials=materials,
+                   scene_roots=[0, 1], images=images, textures=textures,
+                   samplers=samplers)
+
+
 # ------------------------------------------------------------------ WAV
 def write_wav(path, seconds=0.4, rate=44100, freq=440.0, amp=0.5):
     """A soft 'ping' instead of a raw sine: a few partials with a fast
@@ -527,50 +707,10 @@ def write_wav(path, seconds=0.4, rate=44100, freq=440.0, amp=0.5):
         f.write(hdr + bytes(data))
 
 
-# ----------------------------------------------------------- text gltf
-def write_triangle_gltf(dirpath):
-    """plain .gltf with an external .bin - exercises the uri path of the loader"""
-    pos = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
-    nrm = [(0.0, 0.0, 1.0)] * 3
-    idx = [0, 1, 2]
-    bin_data = struct.pack("<9f", *[c for v in pos for c in v])
-    bin_data += struct.pack("<9f", *[c for v in nrm for c in v])
-    bin_data += struct.pack("<3H", *idx)
-    with open(os.path.join(dirpath, "triangle.bin"), "wb") as f:
-        f.write(bin_data)
-
-    doc = {
-        "asset": {"version": "2.0", "generator": "sdge make_assets.py"},
-        "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0, "name": "tri"}],
-        "meshes": [{"primitives": [{
-            "attributes": {"POSITION": 0, "NORMAL": 1},
-            "indices": 2, "mode": 4}]}],
-        "accessors": [
-            {"bufferView": 0, "componentType": FLOAT, "count": 3, "type": "VEC3",
-             "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
-            {"bufferView": 1, "componentType": FLOAT, "count": 3, "type": "VEC3"},
-            {"bufferView": 2, "componentType": UNSIGNED_SHORT, "count": 3,
-             "type": "SCALAR"},
-        ],
-        "bufferViews": [
-            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
-            {"buffer": 0, "byteOffset": 36, "byteLength": 36},
-            {"buffer": 0, "byteOffset": 72, "byteLength": 6},
-        ],
-        "buffers": [{"byteLength": len(bin_data), "uri": "triangle.bin"}],
-    }
-    with open(os.path.join(dirpath, "triangle.gltf"), "w") as f:
-        json.dump(doc, f, separators=(",", ":"))
-
-
 # ------------------------------------------------------------------ main
 def main():
     subjects = os.path.join(ROOT, "Subjects")
-    data = os.path.join(ROOT, "tests", "data")
     os.makedirs(subjects, exist_ok=True)
-    os.makedirs(data, exist_ok=True)
 
     assets = [
         ("cube.glb", box(0, 0, 0, 1, 1, 1), "cube", (0.9, 0.25, 0.2)),
@@ -591,13 +731,13 @@ def main():
         f.write(character_glb())
     print("wrote", path)
 
+    path = os.path.join(subjects, "textured.glb")
+    with open(path, "wb") as f:
+        f.write(textured_cube_glb())
+    print("wrote", path)
+
     write_wav(os.path.join(subjects, "beep.wav"))
     print("wrote", os.path.join(subjects, "beep.wav"))
-    write_wav(os.path.join(data, "beep.wav"))
-    print("wrote", os.path.join(data, "beep.wav"))
-
-    write_triangle_gltf(data)
-    print("wrote", os.path.join(data, "triangle.gltf + .bin"))
     return 0
 
 

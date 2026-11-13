@@ -1,1063 +1,633 @@
-/* src/main.c - Silver Diamond Game Engine :: the showcase application.
- *
- * One window that demonstrates the whole engine:
- *
- *   - the scene manager with the fade transitions (5 scenes)
- *   - the shader GUI: div, button, input, label, checkbox, progress,
- *     slider, radio group and list box
- *   - the TrueType and the OpenType/CFF font loaders (F switches them)
- *   - the 3D world: a skinned glTF model with the animations, the sun,
- *     the ambient and the point lights
- *   - the 3D physics: spheres and boxes bouncing on the floor
- *   - the 2D physics: circles and boxes seen through the 2D camera
- *   - the audio: the spatial wav source and the mp3 music track
- *
- * Keys:
- *   1 / 2   play the animation "idle" / "wave"
- *   M       mute/unmute the audio
- *   P       restart the music track
- *   F       switch the UI font (TrueType <-> OpenType)
- *   SPACE   spawn the bodies in the physics scenes
- *   ESC     quit
- *
- * Automated run (for the tests):
- *   "silver_diamond --shot 30 [file.ppm]"  renders 30 frames and exits
- *   "silver_diamond --scene N"             starts in the scene N
- *   "silver_diamond --font otf|ttf"        picks the UI font
- *   "silver_diamond --drops N"             drops N groups of bodies at start
- */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <direct.h>
+#define sdge_mkdir(path) _mkdir(path)
+#else
+#include <sys/types.h>
+#define sdge_mkdir(path) mkdir(path, 0777)
+#endif
 
 #include <sdge.h>
 
-/* ------------------------------------------------------------ app state */
+#define HUB_PATH_MAX 1024
+
 typedef struct {
-    sdge_window *win;
-    int fbw, fbh;
-
-    /* the camera (orbit) */
-    sdge_camera3d cam;
-    float cam_yaw, cam_pitch, cam_dist;
-    float cam_center[3];
-
-    /* input */
-    double last_mx, last_my;
-    int dragging;
-
-    /* the 3D world */
-    sdge_model *character;
-    sdge_model *floor;
-    int anim_index;
-    char anim_name[64];
-    sdge_sun sun;
-    sdge_ambient_light ambient;
-    sdge_point_light lamp;
-
-    /* the audio */
-    sdge_audio_buffer *beep;
-    sdge_audio_source *beep_src;
-    sdge_audio_buffer *music;
-    sdge_audio_source *music_src;
-    int muted;
-    int audio_ok;
-
-    /* the fonts */
-    sdga_font *font_ttf;
-    sdga_font *font_otf;
-    int font_otf_active;
-
-    /* the gui */
+    sdge_window *window;
     sdge_gui *gui;
-    sdge_scene_manager scenes;
-    sdge_scene menu_scene, world_scene, phys3d_scene, phys2d_scene,
-                credits_scene;
+    int width;
+    int height;
 
-    /* the widgets */
-    sdge_gui_div     menu_panel, world_panel, phys_panel, credits_panel;
-    sdge_gui_button  btn_play, btn_phys, btn_phys2d, btn_credits, btn_quit;
-    sdge_gui_button  btn_back;
-    sdge_gui_button  btn_idle, btn_wave, btn_menu, btn_spawn, btn_reset;
-    sdge_gui_input   name_input;
-    sdge_gui_label   lbl_title, lbl_hint, lbl_fps, lbl_name, lbl_mode;
-    sdge_gui_label   lbl_phys, lbl_credits;
-    sdge_gui_checkbox chk_sound, chk_shadows;
-    sdge_gui_progress prog_load;
-    sdge_gui_slider  sld_zoom;
-    sdge_gui_radio_group radio_group;
-    sdge_gui_radio   radio_low, radio_mid, radio_high;
-    sdge_gui_listbox list_scenes;
+    sdge_gui_div sidebar;
+    sdge_gui_div nav_selected;
+    sdge_gui_div nav_indicator;
+    sdge_gui_div panel;
+    sdge_gui_div template_card;
+    sdge_gui_div template_icon;
+    sdge_gui_label title;
+    sdge_gui_label subtitle;
+    sdge_gui_label logo_mark;
+    sdge_gui_label brand;
+    sdge_gui_label brand_subtitle;
+    sdge_gui_label nav_section;
+    sdge_gui_label nav_projects;
+    sdge_gui_label sidebar_version;
+    sdge_gui_label panel_title;
+    sdge_gui_label panel_subtitle;
+    sdge_gui_label template_category;
+    sdge_gui_label template_name;
+    sdge_gui_label template_description;
+    sdge_gui_label template_detail;
+    sdge_gui_label settings_heading;
+    sdge_gui_label name_label;
+    sdge_gui_label location_label;
+    sdge_gui_label project_preview;
+    sdge_gui_label status;
+    sdge_gui_label footer;
+    sdge_gui_input name_input;
+    sdge_gui_input location_input;
+    sdge_gui_button create_button;
+    sdge_gui_button quit_button;
+} project_hub;
 
-    /* the 2D camera */
-    sdge_camera2d cam2d;
+static project_hub hub;
 
-    /* the 3D physics */
-    sdph3_world *phys3;
-    sdge_mesh box_mesh, sphere_mesh;
-    int phys3_count;
+static const float HUB_COLOR_BACKGROUND[4] = { 0.10f, 0.105f, 0.115f, 1.0f };
+static const float COLOR_SIDEBAR[4] = { 0.075f, 0.08f, 0.09f, 1.0f };
+static const float COLOR_PANEL[4] = { 0.14f, 0.15f, 0.165f, 1.0f };
+static const float COLOR_CARD[4] = { 0.105f, 0.115f, 0.13f, 1.0f };
+static const float COLOR_BORDER[4] = { 0.23f, 0.25f, 0.28f, 1.0f };
+static const float COLOR_ACCENT[4] = { 0.12f, 0.43f, 0.78f, 1.0f };
+static const float COLOR_TEXT[4] = { 0.90f, 0.91f, 0.93f, 1.0f };
+static const float COLOR_MUTED[4] = { 0.59f, 0.62f, 0.67f, 1.0f };
+static const float COLOR_SUCCESS[4] = { 0.50f, 0.84f, 0.59f, 1.0f };
+static const float COLOR_ERROR[4] = { 0.96f, 0.48f, 0.43f, 1.0f };
 
-    /* the 2D physics */
-    sdph2_world *phys2;
-    int phys2_count;
-
-    /* the fps */
-    double last_time;
-    double fps_accum;
-    int fps_frames;
-    int fps_display;
-    char title[256];
-} app;
-
-static app g;
-
-/* the palette */
-static const float C_GOLD[4]    = { 0.93f, 0.78f, 0.42f, 1.0f };
-static const float C_TEXT[4]    = { 0.90f, 0.92f, 0.96f, 1.0f };
-static const float C_MUTED[4]   = { 0.58f, 0.62f, 0.70f, 1.0f };
-static const float C_PANEL[4]   = { 0.09f, 0.10f, 0.14f, 0.90f };
-static const float C_PANEL_B[4] = { 0.25f, 0.28f, 0.38f, 1.0f };
-static const float C_SHADOW[4]  = { 0.0f, 0.0f, 0.0f, 0.45f };
-static const float C_ACCENT[4]  = { 0.35f, 0.70f, 0.95f, 1.0f };
-
-static void set_title(void) {
-    snprintf(g.title, sizeof(g.title),
-             "Silver Diamond Engine - %d fps, scene '%s', font %s%s%s",
-             g.fps_display,
-             sdge_scene_mgr_current(&g.scenes)
-                 ? sdge_scene_mgr_current(&g.scenes)->name : "-",
-             g.font_otf_active ? "OTF/CFF" : "TTF",
-             g.muted ? ", muted" : "",
-             !g.audio_ok ? ", no audio device" : "");
-    sdge_set_window_title(g.win, g.title);
+static int is_separator(char c) {
+    return c == '/' || c == '\\';
 }
 
-/* ----------------------------------------------------------- gui actions */
-static void act_play(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 1);
+static int is_directory(const char *path) {
+    struct stat info;
+    if (stat(path, &info) != 0) return 0;
+    return (info.st_mode & S_IFDIR) != 0;
 }
 
-static void act_phys3d(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 2);
+static int make_directory(const char *path) {
+    if (sdge_mkdir(path) == 0) return 1;
+    return errno == EEXIST && is_directory(path);
 }
 
-static void act_phys2d(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 3);
-}
+static int ensure_directory_tree(const char *path) {
+    char copy[HUB_PATH_MAX];
+    size_t length = strlen(path);
+    size_t start = 0;
 
-static void act_credits(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 4);
-}
+    if (length == 0 || length >= sizeof(copy)) return 0;
+    memcpy(copy, path, length + 1);
 
-static void act_back(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 0);
-}
-
-static void act_quit(void *user) {
-    (void)user;
-    sdge_set_window_should_close(g.win, true);
-}
-
-static void act_idle(void *user) {
-    (void)user;
-    if (g.character && sdge_model_anim_count(g.character) > 0) {
-        sdge_model_play(g.character, 0, 1);
-        g.anim_index = 0;
-        snprintf(g.anim_name, sizeof(g.anim_name), "%s",
-                 sdge_model_anim_name(g.character, 0));
+    if (length >= 2 && is_separator(copy[0]) && is_separator(copy[1])) {
+        size_t i = 2;
+        while (i < length && !is_separator(copy[i])) ++i;
+        if (i == length) return is_directory(copy);
+        ++i;
+        while (i < length && !is_separator(copy[i])) ++i;
+        start = i < length ? i + 1 : length;
     }
-}
 
-static void act_wave(void *user) {
-    (void)user;
-    if (g.character && sdge_model_anim_count(g.character) > 1) {
-        sdge_model_play(g.character, 1, 1);
-        g.anim_index = 1;
-        snprintf(g.anim_name, sizeof(g.anim_name), "%s",
-                 sdge_model_anim_name(g.character, 1));
-    }
-}
+    for (size_t i = start; i <= length; ++i) {
+        if (i != length && !is_separator(copy[i])) continue;
+        if (i == 0) continue;
+        if (i == 2 && copy[1] == ':') continue;
 
-static void act_menu(void *user) {
-    (void)user;
-    sdge_scene_mgr_switch(&g.scenes, 0);
-}
-
-static void act_spawn(void *user) {
-    (void)user;
-    /* drop a few bodies into the physics scenes */
-    for (int i = 0; i < 3; ++i) {
-        if (sdge_scene_mgr_current(&g.scenes) == &g.phys3d_scene) {
-            float x = (float)(rand() % 100 - 50) * 0.05f;
-            float z = (float)(rand() % 100 - 50) * 0.05f;
-            float y = 3.0f + (float)i * 0.7f;
-            if (i % 2 == 0) {
-                sdph3_body *b = sdph3_add_sphere(g.phys3, x, y, z, 0.3f, 1.0f);
-                if (b) b->restitution = 0.55f;
-            } else {
-                sdph3_body *b = sdph3_add_box(g.phys3, x, y, z, 0.35f, 0.35f,
-                                              0.35f, 1.0f);
-                if (b) b->restitution = 0.3f;
-            }
-            g.phys3_count += 3;
-        } else {
-            float x = (float)(rand() % 100 - 50) * 0.05f;
-            float y = 4.0f + (float)i * 0.6f;
-            if (i % 2 == 0) {
-                sdph2_body *b = sdph2_add_circle(g.phys2, x, y, 0.32f, 1.0f);
-                if (b) b->restitution = 0.5f;
-            } else {
-                sdph2_body *b = sdph2_add_box(g.phys2, x, y, 0.35f, 0.35f, 1.0f,
-                                              0.0f);
-                if (b) b->restitution = 0.3f;
-            }
-            g.phys2_count += 3;
+        char saved = copy[i];
+        copy[i] = '\0';
+        if (copy[0] != '\0' && !make_directory(copy)) {
+            copy[i] = saved;
+            return 0;
         }
+        copy[i] = saved;
     }
+
+    return is_directory(copy);
 }
 
-static void act_reset(void *user) {
-    (void)user;
-    if (sdge_scene_mgr_current(&g.scenes) == &g.phys3d_scene) {
-        while (g.phys3 && g.phys3->count > 0) {
-            sdph3_remove(g.phys3, &g.phys3->bodies[0]);
-            g.phys3_count--;
-        }
-    } else {
-        while (g.phys2 && g.phys2->count > 0) {
-            sdph2_remove(g.phys2, &g.phys2->bodies[0]);
-            g.phys2_count--;
-        }
+static int valid_project_name(const char *name) {
+    if (!name || !name[0]) return 0;
+    if (!((name[0] >= 'A' && name[0] <= 'Z') ||
+          (name[0] >= 'a' && name[0] <= 'z') ||
+          (name[0] >= '0' && name[0] <= '9')))
+        return 0;
+
+    for (const char *p = name; *p; ++p) {
+        if (!((*p >= 'A' && *p <= 'Z') ||
+              (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') ||
+              *p == '_' || *p == '-'))
+            return 0;
     }
+    return 1;
 }
 
-static void on_name_changed(void *user, const char *text) {
+static int write_file(const char *path, const char *contents) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+
+    size_t length = strlen(contents);
+    int ok = fwrite(contents, 1, length, file) == length;
+    if (fclose(file) != 0) ok = 0;
+    return ok;
+}
+
+static void set_status(const char *message, int success) {
+    sdge_gui_label_set_text(&hub.status, message);
+    memcpy(hub.status.color, success ? COLOR_SUCCESS : COLOR_ERROR,
+           sizeof(hub.status.color));
+}
+
+static void update_project_preview(void) {
+    char preview[128];
+    snprintf(preview, sizeof(preview), "Project folder: %s/%s",
+             sdge_gui_input_text(&hub.location_input),
+             sdge_gui_input_text(&hub.name_input));
+    sdge_gui_label_set_text(&hub.project_preview, preview);
+}
+
+static void on_project_settings_changed(void *user, const char *text) {
     (void)user;
     (void)text;
+    update_project_preview();
 }
 
-static void on_sound_changed(void *user, int checked) {
+static void create_project(void *user) {
     (void)user;
-    g.muted = !checked;
-    sdge_audio_set_master_volume(checked ? 1.0f : 0.0f);
+    const char *name = sdge_gui_input_text(&hub.name_input);
+    const char *location = sdge_gui_input_text(&hub.location_input);
+    char project_path[HUB_PATH_MAX];
+    char src_path[HUB_PATH_MAX];
+    char assets_path[HUB_PATH_MAX];
+    char main_path[HUB_PATH_MAX];
+    char readme_path[HUB_PATH_MAX];
+    struct stat existing;
+
+    if (!valid_project_name(name)) {
+        set_status("Use a name starting with a letter or digit; only A-Z, 0-9, _ and - are allowed.", 0);
+        return;
+    }
+    if (!location || !location[0]) {
+        set_status("Enter a folder where the project should be created.", 0);
+        return;
+    }
+
+    size_t location_length = strlen(location);
+    while (location_length > 1 && is_separator(location[location_length - 1]) &&
+           !(location_length == 3 && location[1] == ':')) {
+        --location_length;
+    }
+    int separator_needed = location_length > 0 &&
+                           !is_separator(location[location_length - 1]);
+    int written = snprintf(project_path, sizeof(project_path), "%.*s%s%s",
+                           (int)location_length, location,
+                           separator_needed ? "/" : "", name);
+    if (written < 0 || (size_t)written >= sizeof(project_path)) {
+        set_status("The project path is too long.", 0);
+        return;
+    }
+
+    if (stat(project_path, &existing) == 0) {
+        set_status("That project folder already exists. Choose another name or location.", 0);
+        return;
+    }
+    if (errno != ENOENT) {
+        set_status("Cannot inspect the project location. Check the path and permissions.", 0);
+        return;
+    }
+    if (!ensure_directory_tree(project_path)) {
+        set_status("Could not create the project folder. Check the path and permissions.", 0);
+        return;
+    }
+    int src_length = snprintf(src_path, sizeof(src_path), "%s/src", project_path);
+    int assets_length = snprintf(assets_path, sizeof(assets_path), "%s/assets",
+                                 project_path);
+    int main_length = snprintf(main_path, sizeof(main_path), "%s/src/main.c",
+                               project_path);
+    int readme_path_length = snprintf(readme_path, sizeof(readme_path),
+                                      "%s/README.md", project_path);
+    if (src_length < 0 || (size_t)src_length >= sizeof(src_path) ||
+        assets_length < 0 || (size_t)assets_length >= sizeof(assets_path) ||
+        main_length < 0 || (size_t)main_length >= sizeof(main_path) ||
+        readme_path_length < 0 ||
+        (size_t)readme_path_length >= sizeof(readme_path)) {
+        set_status("The project path is too long.", 0);
+        return;
+    }
+    if (!ensure_directory_tree(src_path) || !ensure_directory_tree(assets_path)) {
+        set_status("Project folder created, but its source/assets folders could not be created.", 0);
+        return;
+    }
+
+    char source[1024];
+    int source_length = snprintf(
+        source, sizeof(source),
+        "#include <sdge.h>\n\n"
+        "int main(void) {\n"
+        "    if (!sdge_init()) return 1;\n"
+        "    sdge_window_hint(SDGE_VSYNC, 1);\n"
+        "    sdge_window *window = sdge_create_window(1280, 720, \"%s\", NULL);\n"
+        "    if (!window) {\n"
+        "        sdge_terminate();\n"
+        "        return 1;\n"
+        "    }\n"
+        "    sdge_show_window(window);\n"
+        "    sdge_make_context_current(window);\n"
+        "    while (!sdge_window_should_close(window)) {\n"
+        "        sdge_poll_events();\n"
+        "        sdge_swap_buffers(window);\n"
+        "    }\n"
+        "    sdge_destroy_window(window);\n"
+        "    sdge_terminate();\n"
+        "    return 0;\n"
+        "}\n", name);
+    if (source_length < 0 || (size_t)source_length >= sizeof(source)) {
+        set_status("Could not prepare the starter source file.", 0);
+        return;
+    }
+
+    char readme[768];
+    int readme_length = snprintf(
+        readme, sizeof(readme),
+        "# %s\n\n"
+        "A starter project created with Silver Diamond Project Hub.\n\n"
+        "## Structure\n\n"
+        "- `src/main.c` - application entry point\n"
+        "- `assets/` - put project assets here\n\n"
+        "## Build\n\n"
+        "Use the Silver Diamond SDK from the engine repository: include "
+        "`API/include` and link the library in `API/lib/<platform>/<variant>`. "
+        "On Windows, "
+        "keep `sdge.dll` next to the executable when running it.\n",
+        name);
+    if (readme_length < 0 || (size_t)readme_length >= sizeof(readme) ||
+        !write_file(main_path, source) || !write_file(readme_path, readme)) {
+        set_status("Project folders were created, but starter files could not be written.", 0);
+        return;
+    }
+
+    set_status("Project created. Its source file is in src/main.c.", 1);
 }
 
-static void on_shadows_changed(void *user, int checked) {
+static void quit_hub(void *user) {
     (void)user;
-    (void)checked;
+    sdge_set_window_should_close(hub.window, true);
 }
 
-static void on_zoom_changed(void *user, float value) {
-    (void)user;
-    g.cam_dist = 2.0f + value * 10.0f;
+static void layout_widgets(void) {
+    float width = (float)hub.width;
+    float height = (float)hub.height;
+    const float sidebar_width = 226.0f;
+    float content_x = sidebar_width + 32.0f;
+    float content_width = width - content_x - 32.0f;
+    float panel_height = height - 162.0f;
+    if (content_width < 650.0f) content_width = 650.0f;
+    if (panel_height < 480.0f) panel_height = 480.0f;
+    float panel_x = content_x;
+    float panel_y = 132.0f;
+    float template_x = panel_x + 28.0f;
+    float template_y = panel_y + 112.0f;
+    float template_width = 226.0f;
+    float settings_x = template_x + template_width + 34.0f;
+    float settings_width = content_width - (settings_x - panel_x) - 30.0f;
+    if (settings_width < 260.0f) settings_width = 260.0f;
+
+    sdge_gui_div_set_rect(&hub.sidebar, 0.0f, 0.0f, sidebar_width, height);
+    sdge_gui_div_set_rect(&hub.nav_selected, 12.0f, 136.0f,
+                          sidebar_width - 24.0f, 42.0f);
+    sdge_gui_div_set_rect(&hub.nav_indicator, 12.0f, 136.0f, 3.0f, 42.0f);
+    sdge_gui_div_set_rect(&hub.panel, panel_x, panel_y, content_width,
+                          panel_height);
+    sdge_gui_div_set_rect(&hub.template_card, template_x, template_y,
+                          template_width, 308.0f);
+    sdge_gui_div_set_rect(&hub.template_icon, template_x + 18.0f,
+                          template_y + 18.0f, 46.0f, 46.0f);
+
+    hub.logo_mark.base.x = 24.0f;
+    hub.logo_mark.base.y = 25.0f;
+    hub.brand.base.x = 68.0f;
+    hub.brand.base.y = 22.0f;
+    hub.brand_subtitle.base.x = 68.0f;
+    hub.brand_subtitle.base.y = 46.0f;
+    hub.nav_section.base.x = 24.0f;
+    hub.nav_section.base.y = 106.0f;
+    hub.nav_projects.base.x = 38.0f;
+    hub.nav_projects.base.y = 144.0f;
+    hub.sidebar_version.base.x = 24.0f;
+    hub.sidebar_version.base.y = height - 90.0f;
+    hub.quit_button.base.x = 18.0f;
+    hub.quit_button.base.y = height - 56.0f;
+    hub.quit_button.base.w = sidebar_width - 36.0f;
+
+    hub.title.base.x = content_x;
+    hub.title.base.y = 28.0f;
+    hub.title.base.w = content_width - 210.0f;
+    hub.subtitle.base.x = content_x;
+    hub.subtitle.base.y = 68.0f;
+    hub.subtitle.base.w = content_width - 32.0f;
+
+    hub.panel_title.base.x = panel_x + 28.0f;
+    hub.panel_title.base.y = panel_y + 22.0f;
+    hub.panel_title.base.w = content_width - 56.0f;
+    hub.panel_subtitle.base.x = panel_x + 28.0f;
+    hub.panel_subtitle.base.y = panel_y + 57.0f;
+    hub.panel_subtitle.base.w = content_width - 56.0f;
+
+    hub.template_category.base.x = template_x + 76.0f;
+    hub.template_category.base.y = template_y + 20.0f;
+    hub.template_name.base.x = template_x + 18.0f;
+    hub.template_name.base.y = template_y + 82.0f;
+    hub.template_detail.base.x = template_x + 18.0f;
+    hub.template_detail.base.y = template_y + 112.0f;
+    hub.template_description.base.x = template_x + 18.0f;
+    hub.template_description.base.y = template_y + 162.0f;
+
+    hub.settings_heading.base.x = settings_x;
+    hub.settings_heading.base.y = template_y + 2.0f;
+    hub.settings_heading.base.w = settings_width;
+    hub.name_label.base.x = settings_x;
+    hub.name_label.base.y = template_y + 48.0f;
+    hub.name_input.base.x = settings_x;
+    hub.name_input.base.y = template_y + 74.0f;
+    hub.name_input.base.w = settings_width;
+    hub.location_label.base.x = settings_x;
+    hub.location_label.base.y = template_y + 144.0f;
+    hub.location_input.base.x = settings_x;
+    hub.location_input.base.y = template_y + 170.0f;
+    hub.location_input.base.w = settings_width;
+    hub.project_preview.base.x = settings_x;
+    hub.project_preview.base.y = template_y + 218.0f;
+    hub.project_preview.base.w = settings_width;
+
+    hub.status.base.x = panel_x + 28.0f;
+    hub.status.base.y = panel_y + panel_height - 88.0f;
+    hub.status.base.w = content_width - 248.0f;
+    hub.create_button.base.x = panel_x + content_width - 202.0f;
+    hub.create_button.base.y = panel_y + panel_height - 82.0f;
+    hub.footer.base.x = panel_x + 28.0f;
+    hub.footer.base.y = panel_y + panel_height - 42.0f;
+    hub.footer.base.w = content_width - 56.0f;
 }
 
-static void on_quality_changed(void *user, int index) {
-    (void)user;
-    (void)index;
+static void on_error(int code, const char *description) {
+    fprintf(stderr, "engine error %d: %s\n", code, description);
 }
 
-static void on_scene_picked(void *user, int index) {
-    (void)user;
-    if (index >= 0 && index < 5)
-        sdge_scene_mgr_switch(&g.scenes, index);
-}
-
-/* -------------------------------------------------------------- callbacks */
-static void on_key(sdge_window *w, int key, int sc, int action, int mods) {
-    (void)w; (void)sc; (void)mods;
+static void on_key(sdge_window *window, int key, int scancode, int action, int mods) {
+    (void)window;
+    (void)scancode;
+    (void)mods;
     if (action != SDGE_PRESS) return;
-
     if (key == SDGE_KEY_ESCAPE) {
-        sdge_set_window_should_close(g.win, true);
+        sdge_set_window_should_close(hub.window, true);
         return;
     }
-    if (key == SDGE_KEY_1) { act_idle(NULL); return; }
-    if (key == SDGE_KEY_2) { act_wave(NULL); return; }
-    if (key == SDGE_KEY_M) {
-        g.muted = !g.muted;
-        sdge_audio_set_master_volume(g.muted ? 0.0f : 1.0f);
-        sdge_gui_checkbox_set(&g.chk_sound, g.muted ? 0 : 1);
-        set_title();
-        return;
-    }
-    if (key == SDGE_KEY_P) {
-        if (g.music_src) {
-            sdge_audio_source_stop(g.music_src);
-            sdge_audio_source_play(g.music_src);
-        }
-        return;
-    }
-    if (key == SDGE_KEY_F) {
-        if (g.font_ttf && g.font_otf) {
-            g.font_otf_active = !g.font_otf_active;
-            sdui_set_font(g.font_otf_active ? g.font_otf : g.font_ttf);
-        }
-        return;
-    }
-    if (key == SDGE_KEY_SPACE) { act_spawn(NULL); return; }
-    if (g.gui) sdge_gui_key(g.gui, key, action);
-    sdge_scene_mgr_event(&g.scenes, SDGE_SCENE_EVENT_KEY, key);
+    sdge_gui_key(hub.gui, key, action);
 }
 
-static void on_char(sdge_window *w, unsigned codepoint) {
-    (void)w;
-    if (g.gui) sdge_gui_char(g.gui, codepoint);
+static void on_char(sdge_window *window, unsigned codepoint) {
+    (void)window;
+    sdge_gui_char(hub.gui, codepoint);
 }
 
-static void on_button(sdge_window *w, int button, int action, int mods) {
-    (void)w; (void)mods;
-    if (g.gui) sdge_gui_mouse_button(g.gui, button, action);
-    if (button == SDGE_MOUSE_BUTTON_LEFT && action == SDGE_PRESS) {
-        if (!g.gui || sdge_gui_hovered(g.gui) < 0) {
-            g.dragging = 1;
-            sdge_get_cursor_pos(g.win, &g.last_mx, &g.last_my);
-        } else {
-            g.dragging = 0;
-        }
-    } else if (button == SDGE_MOUSE_BUTTON_LEFT && action == SDGE_RELEASE) {
-        g.dragging = 0;
-    }
+static void on_mouse_button(sdge_window *window, int button, int action, int mods) {
+    (void)window;
+    (void)mods;
+    sdge_gui_mouse_button(hub.gui, button, action);
 }
 
-static void on_cursor(sdge_window *w, double x, double y) {
-    (void)w;
-    if (g.gui) sdge_gui_mouse_move(g.gui, (float)x, (float)y);
-    if (!g.dragging) return;
-    g.cam_yaw   -= (float)(x - g.last_mx) * 0.008f;
-    g.cam_pitch += (float)(y - g.last_my) * 0.008f;
-    if (g.cam_pitch > 1.45f) g.cam_pitch = 1.45f;
-    if (g.cam_pitch < 0.05f) g.cam_pitch = 0.05f;
-    g.last_mx = x;
-    g.last_my = y;
+static void on_cursor(sdge_window *window, double x, double y) {
+    (void)window;
+    sdge_gui_mouse_move(hub.gui, (float)x, (float)y);
 }
 
-static void on_scroll(sdge_window *w, double dx, double dy) {
-    (void)w; (void)dx;
-    if (g.gui) sdge_gui_scroll(g.gui, (float)dy);
-    g.cam_dist *= (dy > 0) ? 0.9f : 1.1f;
-    if (g.cam_dist < 1.0f)  g.cam_dist = 1.0f;
-    if (g.cam_dist > 15.0f) g.cam_dist = 15.0f;
+static void on_size(sdge_window *window, int width, int height) {
+    (void)window;
+    (void)width;
+    (void)height;
+    sdge_get_framebuffer_size(hub.window, &hub.width, &hub.height);
+    layout_widgets();
 }
 
-static void on_size(sdge_window *w, int width, int height) {
-    (void)w;
-    g.fbw = width;
-    g.fbh = height;
+static void add_widget(sdge_widget *widget) {
+    if (sdge_gui_add(hub.gui, widget) < 0)
+        fprintf(stderr, "project hub: could not register a GUI widget\n");
 }
 
-static void on_error(int code, const char *desc) {
-    fprintf(stderr, "engine error %d: %s\n", code, desc);
+static void style_primary_button(sdge_gui_button *button) {
+    const float hover[4] = { 0.17f, 0.52f, 0.88f, 1.0f };
+    const float active[4] = { 0.09f, 0.35f, 0.66f, 1.0f };
+    memcpy(button->color, COLOR_ACCENT, sizeof(button->color));
+    memcpy(button->color_hover, hover, sizeof(button->color_hover));
+    memcpy(button->color_active, active, sizeof(button->color_active));
+    memcpy(button->border_color, COLOR_ACCENT, sizeof(button->border_color));
+    memcpy(button->text_color, COLOR_TEXT, sizeof(button->text_color));
+    button->radius = 5.0f;
+    button->border_width = 0.0f;
+    button->shadow_color[3] = 0.0f;
 }
 
-/* ----------------------------------------------------------------- scenes */
-static void show_only_menu(void) {
-    g.menu_panel.base.visible = 0;
-    g.world_panel.base.visible = 0;
-    g.phys_panel.base.visible = 0;
-    g.credits_panel.base.visible = 0;
-    g.btn_play.base.visible = 0;
-    g.btn_phys.base.visible = 0;
-    g.btn_phys2d.base.visible = 0;
-    g.btn_credits.base.visible = 0;
-    g.btn_quit.base.visible = 0;
-    g.btn_back.base.visible = 0;
-    g.name_input.base.visible = 0;
-    g.list_scenes.base.visible = 0;
-    g.lbl_title.base.visible = 0;
-    g.lbl_hint.base.visible = 0;
-    g.lbl_fps.base.visible = 0;
-    g.lbl_name.base.visible = 0;
-    g.lbl_mode.base.visible = 0;
-    g.lbl_phys.base.visible = 0;
-    g.lbl_credits.base.visible = 0;
-    g.chk_sound.base.visible = 0;
-    g.chk_shadows.base.visible = 0;
-    g.prog_load.base.visible = 0;
-    g.sld_zoom.base.visible = 0;
-    g.radio_low.base.visible = 0;
-    g.radio_mid.base.visible = 0;
-    g.radio_high.base.visible = 0;
-    g.btn_idle.base.visible = 0;
-    g.btn_wave.base.visible = 0;
-    g.btn_menu.base.visible = 0;
-    g.btn_spawn.base.visible = 0;
-    g.btn_reset.base.visible = 0;
-}
-
-static void menu_on_enter(sdge_scene *s) {
-    (void)s;
-    show_only_menu();
-    g.menu_panel.base.visible = 1;
-    g.btn_play.base.visible = 1;
-    g.btn_phys.base.visible = 1;
-    g.btn_phys2d.base.visible = 1;
-    g.btn_credits.base.visible = 1;
-    g.btn_quit.base.visible = 1;
-    g.name_input.base.visible = 1;
-    g.list_scenes.base.visible = 1;
-    g.chk_sound.base.visible = 1;
-    g.chk_shadows.base.visible = 1;
-    g.prog_load.base.visible = 1;
-    g.sld_zoom.base.visible = 1;
-    g.radio_low.base.visible = 1;
-    g.radio_mid.base.visible = 1;
-    g.radio_high.base.visible = 1;
-}
-
-static void menu_on_gui(sdge_scene *s, sdge_gui *gui) {
-    (void)s;
-    float px = g.menu_panel.base.x, py = g.menu_panel.base.y;
-    float pw = g.menu_panel.base.w;
-    sdge_gui_text_center(gui, px, py + 16.0f, pw, 40.0f, "SILVER DIAMOND", 30.0f,
-                         C_GOLD);
-    sdge_gui_text_center(gui, px, py + 50.0f, pw, 22.0f,
-                         "the engine showcase", 14.0f, C_MUTED);
-    sdge_gui_text_center(gui, g.lbl_mode.base.x, 372.0f, 200.0f, 20.0f,
-                         "1/2 anim  M mute  P music  F font", 11.0f, C_MUTED);
-}
-
-static void world_on_enter(sdge_scene *s) {
-    (void)s;
-    show_only_menu();
-    g.world_panel.base.visible = 1;
-    g.btn_idle.base.visible = 1;
-    g.btn_wave.base.visible = 1;
-    g.btn_menu.base.visible = 1;
-    g.lbl_fps.base.visible = 1;
-    g.lbl_fps.base.x = 296.0f;
-    g.lbl_fps.base.y = 24.0f;
-    g.lbl_fps.base.w = 160.0f;
-    sdge_gui_label_set_text(&g.lbl_fps, "the world scene");
-    /* frame the skinned character (it is about 1.8 units tall) */
-    g.cam_center[0] = 0.0f; g.cam_center[1] = 0.9f; g.cam_center[2] = 0.0f;
-    g.cam_yaw = 0.55f; g.cam_pitch = 0.28f; g.cam_dist = 2.6f;
-}
-
-static void world_on_update(sdge_scene *s, float dt) {
-    (void)s; (void)dt;
-}
-
-static void world_on_render(sdge_scene *s) {
-    (void)s;
-    if (g.floor)     sdge_model_draw(g.floor, NULL);
-    if (g.character) sdge_model_draw(g.character, NULL);
-}
-
-static void world_on_gui(sdge_scene *s, sdge_gui *gui) {
-    (void)s;
-    float px = g.world_panel.base.x, py = g.world_panel.base.y;
-    char line[128];
-    sdge_gui_text(gui, px + 16.0f, py + 12.0f, "WORLD", 16.0f, C_GOLD);
-    snprintf(line, sizeof(line), "fps      %d", g.fps_display);
-    sdge_gui_text(gui, px + 16.0f, py + 40.0f, line, 13.0f, C_TEXT);
-    snprintf(line, sizeof(line), "anim     %s",
-             g.anim_index >= 0 ? g.anim_name : "bind pose");
-    sdge_gui_text(gui, px + 16.0f, py + 60.0f, line, 13.0f, C_TEXT);
-    snprintf(line, sizeof(line), "music    %s",
-             g.music_src && sdge_audio_source_playing(g.music_src)
-                 ? "playing" : "stopped");
-    sdge_gui_text(gui, px + 16.0f, py + 80.0f, line, 13.0f, C_TEXT);
-    snprintf(line, sizeof(line), "font     %s",
-             g.font_otf_active ? "OTF/CFF" : "TrueType");
-    sdge_gui_text(gui, px + 16.0f, py + 100.0f, line, 13.0f, C_TEXT);
-}
-
-static void phys3d_on_enter(sdge_scene *s) {
-    (void)s;
-    show_only_menu();
-    g.phys_panel.base.visible = 1;
-    g.btn_spawn.base.visible = 1;
-    g.btn_reset.base.visible = 1;
-    g.btn_menu.base.visible = 1;
-    g.cam_dist = 9.0f;
-    if (g.phys3_count == 0) act_spawn(NULL);
-}
-
-static void phys3d_on_update(sdge_scene *s, float dt) {
-    (void)s;
-    if (g.phys3) sdph3_step(g.phys3, dt);
-}
-
-static void phys3d_on_render(sdge_scene *s) {
-    (void)s;
-    if (!g.phys3) return;
-    /* the floor and the bodies */
-    for (int i = 0; i < g.phys3->count; ++i) {
-        const sdph3_body *b = &g.phys3->bodies[i];
-        float col[4] = { 0.85f, 0.72f, 0.45f, 1.0f };
-        if (b->shape == SDPH3_SPHERE) col[1] = 0.45f;
-        if (b->inv_mass <= 0.0f) {
-            /* the static floor: a darker slab */
-            col[0] = 0.16f; col[1] = 0.18f; col[2] = 0.24f;
-        }
-
-        /* the model matrix: T * R * S, with the mesh built as a 0.35 box and
-         * a 0.3 sphere */
-        float cx = cosf(b->angle[0]), sx = sinf(b->angle[0]);
-        float cy = cosf(b->angle[1]), sy = sinf(b->angle[1]);
-        float cz = cosf(b->angle[2]), sz = sinf(b->angle[2]);
-        float r[9];
-        r[0] = cz * cy; r[1] = cz * sy * sx - sz * cx; r[2] = cz * sy * cx + sz * sx;
-        r[3] = sz * cy; r[4] = sz * sy * sx + cz * cx; r[5] = sz * sy * cx - cz * sx;
-        r[6] = -sy;     r[7] = cy * sx;                r[8] = cy * cx;
-        float sc[3];
-        if (b->shape == SDPH3_SPHERE) {
-            float k = b->radius / 0.3f;
-            sc[0] = sc[1] = sc[2] = k;
-        } else {
-            sc[0] = b->half[0] / 0.35f;
-            sc[1] = b->half[1] / 0.35f;
-            sc[2] = b->half[2] / 0.35f;
-        }
-        float m[16];
-        /* column c of R*S is the c-th column of R times sc[c] */
-        m[0] = r[0] * sc[0]; m[1] = r[3] * sc[0]; m[2] = r[6] * sc[0]; m[3] = 0;
-        m[4] = r[1] * sc[1]; m[5] = r[4] * sc[1]; m[6] = r[7] * sc[1]; m[7] = 0;
-        m[8] = r[2] * sc[2]; m[9] = r[5] * sc[2]; m[10] = r[8] * sc[2]; m[11] = 0;
-        m[12] = b->pos[0]; m[13] = b->pos[1]; m[14] = b->pos[2]; m[15] = 1;
-
-        const sdge_mesh *mesh = (b->shape == SDPH3_SPHERE) ? &g.sphere_mesh
-                                                           : &g.box_mesh;
-        /* added the last 0 for base_texture */
-        sdgr_draw_mesh(mesh, m, NULL, 0, col, 0.1f, 0.5f, 0, 0);
-    }
-}
-
-static void phys3d_on_gui(sdge_scene *s, sdge_gui *gui) {
-    (void)s;
-    float px = g.phys_panel.base.x, py = g.phys_panel.base.y;
-    char line[128];
-    sdge_gui_text(gui, px + 16.0f, py + 12.0f, "3D PHYSICS", 16.0f, C_GOLD);
-    snprintf(line, sizeof(line), "bodies   %d", g.phys3 ? g.phys3->count : 0);
-    sdge_gui_text(gui, px + 16.0f, py + 40.0f, line, 13.0f, C_TEXT);
-    snprintf(line, sizeof(line), "contacts %d", g.phys3 ? g.phys3->contacts : 0);
-    sdge_gui_text(gui, px + 16.0f, py + 60.0f, line, 13.0f, C_TEXT);
-    sdge_gui_text(gui, px + 16.0f, py + 80.0f, "SPACE drops the bodies", 12.0f,
-                  C_MUTED);
-}
-
-static void phys2d_on_enter(sdge_scene *s) {
-    (void)s;
-    show_only_menu();
-    g.phys_panel.base.visible = 1;
-    g.btn_spawn.base.visible = 1;
-    g.btn_reset.base.visible = 1;
-    g.btn_menu.base.visible = 1;
-    if (g.phys2_count == 0) act_spawn(NULL);
-}
-
-static void phys2d_on_update(sdge_scene *s, float dt) {
-    (void)s;
-    if (g.phys2) sdph2_step(g.phys2, dt);
-}
-
-static void phys2d_on_gui(sdge_scene *s, sdge_gui *gui) {
-    (void)s;
-    /* the bodies are drawn through the UI shader (a top view) */
-    if (g.phys2) {
-        float z = g.cam2d.zoom;
-        for (int i = 0; i < g.phys2->count; ++i) {
-            const sdph2_body *b = &g.phys2->bodies[i];
-            float scr[2];
-            sdge_camera2d_world_to_screen(&g.cam2d, b->pos[0], b->pos[1], scr);
-            float col[4] = { 0.85f, 0.72f, 0.45f, 1.0f };
-            if (b->shape == SDPH2_CIRCLE) {
-                col[1] = 0.45f;
-                float r = b->radius * z;
-                sdge_gui_round(gui, scr[0] - r, scr[1] - r, r * 2.0f, r * 2.0f,
-                               r, col);
-            } else {
-                float hw = b->half[0] * z, hh = b->half[1] * z;
-                sdge_gui_round(gui, scr[0] - hw, scr[1] - hh, hw * 2.0f, hh * 2.0f,
-                               3.0f, col);
-            }
-        }
-    }
-    float px = g.phys_panel.base.x, py = g.phys_panel.base.y;
-    char line[128];
-    sdge_gui_text(gui, px + 16.0f, py + 12.0f, "2D PHYSICS", 16.0f, C_GOLD);
-    snprintf(line, sizeof(line), "bodies   %d", g.phys2 ? g.phys2->count : 0);
-    sdge_gui_text(gui, px + 16.0f, py + 40.0f, line, 13.0f, C_TEXT);
-    snprintf(line, sizeof(line), "contacts %d", g.phys2 ? g.phys2->contacts : 0);
-    sdge_gui_text(gui, px + 16.0f, py + 60.0f, line, 13.0f, C_TEXT);
-    sdge_gui_text(gui, px + 16.0f, py + 80.0f, "the 2D camera draws them", 12.0f,
-                  C_MUTED);
-}
-
-static void credits_on_enter(sdge_scene *s) {
-    (void)s;
-    show_only_menu();
-    g.credits_panel.base.visible = 1;
-    g.btn_back.base.visible = 1;
-}
-
-static void credits_on_gui(sdge_scene *s, sdge_gui *gui) {
-    (void)s;
-    float px = g.credits_panel.base.x, py = g.credits_panel.base.y;
-    float pw = g.credits_panel.base.w;
-    sdge_gui_text_center(gui, px, py + 24.0f, pw, 34.0f, "CREDITS", 24.0f, C_GOLD);
-    const char *lines[7] = {
-        "Silver Diamond Game Engine 0.3",
-        "renderer   - forward PBR-lite, GL 3.3+",
-        "gui        - one shader: SDF shapes + a font atlas",
-        "fonts      - TrueType (glyf) and OpenType/CFF",
-        "physics    - 2D and 3D rigid bodies, impulses",
-        "audio      - 48 kHz mixer, wav + mp3",
-        "assets     - glTF 2.0, animation and skinning"
-    };
-    for (int i = 0; i < 7; ++i)
-        sdge_gui_text(gui, px + 40.0f, py + 78.0f + (float)i * 22.0f, lines[i],
-                      13.0f, i == 0 ? C_TEXT : C_MUTED);
-}
-
-/* ------------------------------------------------------------------ main */
-int main(int argc, char **argv) {
-    memset(&g, 0, sizeof(g));
-
-    int shot_frame = 0;
-    const char *shot_path = "demo_shot.ppm";
-    int start_scene = 0;
-    int want_otf = 0;
-    int auto_drops = 0;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
-            shot_frame = atoi(argv[++i]);
-            if (shot_frame < 1) shot_frame = 1;
-            if (i + 1 < argc && argv[i + 1][0] != '-') shot_path = argv[++i];
-        } else if (strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
-            start_scene = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--font") == 0 && i + 1 < argc) {
-            want_otf = (strstr(argv[++i], "otf") != NULL);
-        } else if (strcmp(argv[i], "--drops") == 0 && i + 1 < argc) {
-            auto_drops = atoi(argv[++i]);
-            if (auto_drops < 0) auto_drops = 0;
-            if (auto_drops > 100) auto_drops = 100;
-        }
-    }
-    int frame_no = 0;
-
+int main(void) {
     if (!sdge_init()) {
-        fprintf(stderr, "engine init failed\n");
+        fprintf(stderr, "engine initialization failed\n");
         return 1;
     }
     sdge_set_error_callback(on_error);
-
     sdge_window_hint(SDGE_VSYNC, 1);
-    g.win = sdge_create_window(1280, 720, "Silver Diamond Engine", NULL);
-    if (!g.win) {
+    sdge_window_hint(SDGE_RESIZABLE, 1);
+
+    hub.window = sdge_create_window(1280, 800, "Silver Diamond - Project Hub", NULL);
+    if (!hub.window) {
         fprintf(stderr, "window creation failed\n");
         sdge_terminate();
         return 1;
     }
 
-    sdge_set_key_callback(g.win, on_key);
-    sdge_set_char_callback(g.win, on_char);
-    sdge_set_mouse_button_callback(g.win, on_button);
-    sdge_set_cursor_pos_callback(g.win, on_cursor);
-    sdge_set_scroll_callback(g.win, on_scroll);
-    sdge_set_window_size_callback(g.win, on_size);
+    sdge_show_window(hub.window);
+    sdge_make_context_current(hub.window);
+    sdge_get_framebuffer_size(hub.window, &hub.width, &hub.height);
 
-    sdge_get_framebuffer_size(g.win, &g.fbw, &g.fbh);
-    sdge_show_window(g.win);
-    sdge_make_context_current(g.win);
-
-    int gl_ok = (sdgr_init() == 0);
-    int ui_ok = (sdui_init() == 0);
-    if (!ui_ok) fprintf(stderr, "demo: the UI renderer is not available\n");
-
-    /* the fonts: a TTF and an OpenType/CFF one, rasterized at every size
-     * the UI uses (so the text is never scaled down) */
-    if (ui_ok) {
-        g.font_ttf = sdga_load_font("assets/font.ttf", 30.0f);
-        g.font_otf = sdga_load_font("assets/font.otf", 30.0f);
-        static const float sizes[] = { 12.0f, 13.0f, 14.0f, 16.0f, 18.0f,
-                                      22.0f, 30.0f };
-        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-            if (g.font_ttf) sdga_font_add_face(g.font_ttf, sizes[i]);
-            if (g.font_otf) sdga_font_add_face(g.font_otf, sizes[i]);
-        }
-        if (g.font_ttf) {
-            sdui_set_font(want_otf && g.font_otf ? g.font_otf : g.font_ttf);
-            g.font_otf_active = (want_otf && g.font_otf) ? 1 : 0;
-            fprintf(stderr, "demo: font '%s' (%d glyphs, %d sizes)\n",
-                    sdga_font_name(sdui_get_font()),
-                    sdga_font_glyph_count(g.font_ttf),
-                    sdga_font_face_count(g.font_ttf));
-        }
-        if (g.font_otf)
-            fprintf(stderr, "demo: font '%s' (%d glyphs, %d sizes)\n",
-                    sdga_font_name(g.font_otf),
-                    sdga_font_glyph_count(g.font_otf),
-                    sdga_font_face_count(g.font_otf));
+    if (sdgr_init() != 0) {
+        fprintf(stderr, "renderer initialization failed\n");
+        sdge_destroy_window(hub.window);
+        sdge_terminate();
+        return 1;
+    }
+    if (sdui_init() != 0) {
+        fprintf(stderr, "UI initialization failed\n");
+        sdgr_shutdown();
+        sdge_destroy_window(hub.window);
+        sdge_terminate();
+        return 1;
     }
 
-    /* the 3D world */
-    g.cam_center[0] = 0.0f; g.cam_center[1] = 1.0f; g.cam_center[2] = 0.0f;
-    g.cam_yaw = 0.6f; g.cam_pitch = 0.35f; g.cam_dist = 4.0f;
-    sdge_camera3d_init(&g.cam, 50.0f, (float)g.fbw / (float)g.fbh, 0.1f, 100.0f);
-    sdge_sun_init(&g.sun, NULL, NULL, 2.2f);
-    sdge_ambient_light_init(&g.ambient, NULL);
-    {
-        float pos[3] = { 2.0f, 3.0f, 2.0f };
-        float col[3] = { 1.0f, 0.75f, 0.45f };
-        sdge_point_light_init(&g.lamp, pos, col, 1.4f, 9.0f);
+    hub.gui = sdge_gui_create();
+    if (!hub.gui) {
+        fprintf(stderr, "GUI initialization failed\n");
+        sdui_shutdown();
+        sdgr_shutdown();
+        sdge_destroy_window(hub.window);
+        sdge_terminate();
+        return 1;
     }
 
-    if (gl_ok) {
-        /* Обновленные пути к файлам в соответствии с папкой assets/ */
-        g.character = sdge_model_load("assets/scene.glb");
-        if (g.character && sdge_model_anim_count(g.character) > 0) {
-            sdge_model_play(g.character, 0, 1);
-            g.anim_index = 0;
-            snprintf(g.anim_name, sizeof(g.anim_name), "%s",
-                     sdge_model_anim_name(g.character, 0));
-        }
-        
-        /* В качестве пола используем room.gltf */
-        g.floor = sdge_model_load("Subjects/plane.glb");
-        
-        if (gl_ok) {
-            sdge_mesh_create_box(&g.box_mesh, 0.35f, 0.35f, 0.35f);
-            sdge_mesh_create_sphere(&g.sphere_mesh, 0.3f, 20, 12);
-        }
-    }
+    sdge_gui_div_init(&hub.sidebar, 0.0f, 0.0f, 226.0f, 800.0f,
+                      COLOR_SIDEBAR);
+    sdge_gui_div_init(&hub.nav_selected, 12.0f, 136.0f, 202.0f, 42.0f,
+                      COLOR_PANEL);
+    hub.nav_selected.radius = 5.0f;
+    sdge_gui_div_init(&hub.nav_indicator, 12.0f, 136.0f, 3.0f, 42.0f,
+                      COLOR_ACCENT);
+    sdge_gui_div_init(&hub.panel, 258.0f, 132.0f, 990.0f, 638.0f,
+                      COLOR_PANEL);
+    hub.panel.border_color[0] = COLOR_BORDER[0];
+    hub.panel.border_color[1] = COLOR_BORDER[1];
+    hub.panel.border_color[2] = COLOR_BORDER[2];
+    hub.panel.border_color[3] = COLOR_BORDER[3];
+    hub.panel.border_width = 1.0f;
+    hub.panel.radius = 7.0f;
+    sdge_gui_div_init(&hub.template_card, 286.0f, 244.0f, 226.0f, 308.0f,
+                      COLOR_CARD);
+    hub.template_card.border_color[0] = COLOR_ACCENT[0];
+    hub.template_card.border_color[1] = COLOR_ACCENT[1];
+    hub.template_card.border_color[2] = COLOR_ACCENT[2];
+    hub.template_card.border_color[3] = COLOR_ACCENT[3];
+    hub.template_card.border_width = 1.0f;
+    hub.template_card.radius = 6.0f;
+    sdge_gui_div_init(&hub.template_icon, 304.0f, 262.0f, 46.0f, 46.0f,
+                      COLOR_ACCENT);
+    hub.template_icon.radius = 8.0f;
 
-    /* the physics worlds */
-    g.phys3 = sdph3_world_create();
-    if (g.phys3) {
-        sdph3_world_set_gravity(g.phys3, 0.0f, -9.81f, 0.0f);
-        sdph3_world_set_bounds(g.phys3, 1, -6.0f, -1.0f, -6.0f,
-                               6.0f, 12.0f, 6.0f);
-        sdph3_add_box(g.phys3, 0.0f, -0.5f, 0.0f, 6.0f, 0.5f, 6.0f, 0.0f);
-    }
-    g.phys2 = sdph2_world_create();
-    if (g.phys2) {
-        sdph2_world_set_gravity(g.phys2, 0.0f, -9.81f);
-        sdph2_world_set_bounds(g.phys2, 1, -8.0f, -8.0f, 8.0f, 8.0f);
-        sdph2_add_box(g.phys2, 0.0f, -8.5f, 8.5f, 0.5f, 0.0f, 0.0f);
-    }
-    sdge_camera2d_init(&g.cam2d, g.fbw, g.fbh);
-    sdge_camera2d_set_zoom(&g.cam2d, 18.0f);
+    sdge_gui_label_init(&hub.logo_mark, 24.0f, 25.0f, 32.0f, 32.0f,
+                        "SD", 15.0f, COLOR_TEXT);
+    hub.logo_mark.align = SDGE_GUI_ALIGN_CENTER;
+    sdge_gui_label_init(&hub.brand, 68.0f, 22.0f, 144.0f, 22.0f,
+                        "SILVER DIAMOND", 14.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.brand_subtitle, 68.0f, 46.0f, 140.0f, 18.0f,
+                        "GAME ENGINE", 10.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.nav_section, 24.0f, 106.0f, 160.0f, 18.0f,
+                        "WORKSPACE", 10.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.nav_projects, 38.0f, 144.0f, 160.0f, 26.0f,
+                        "Projects", 14.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.sidebar_version, 24.0f, 710.0f, 180.0f, 18.0f,
+                        "SILVER DIAMOND  0.3", 10.0f, COLOR_MUTED);
 
-    /* the audio */
-    sdge_audio_init();
-    g.audio_ok = sdge_audio_has_device();
-    g.beep = sdge_audio_load_wav("assets/beep.wav");
-    if (g.beep) {
-        g.beep_src = sdge_audio_source_create(g.beep);
-        if (g.beep_src) {
-            sdge_audio_source_set_loop(g.beep_src, 1);
-            sdge_audio_source_set_distance(g.beep_src, 1.0f, 30.0f);
-            /* the ping is a background effect - keep it quiet */
-            sdge_audio_source_set_volume(g.beep_src, 0.18f);
-            sdge_audio_source_play(g.beep_src);
-        }
-    }
-    g.music = sdge_audio_load_file("assets/Detective(2).mp3");
-    if (g.music) {
-        g.music_src = sdge_audio_source_create(g.music);
-        if (g.music_src) {
-            sdge_audio_source_set_loop(g.music_src, 1);
-            sdge_audio_source_set_volume(g.music_src, 0.6f);
-            sdge_audio_source_play(g.music_src);
-            fprintf(stderr, "demo: music '%s' - %d ch, %d Hz, %.1f s\n",
-                    "assets/Detective(2).mp3", g.music->channels,
-                    g.music->sample_rate,
-                    (double)g.music->frame_count / (double)g.music->sample_rate);
-        }
-    }
+    sdge_gui_label_init(&hub.title, 258.0f, 28.0f, 780.0f, 34.0f,
+                        "Projects", 25.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.subtitle, 258.0f, 68.0f, 850.0f, 24.0f,
+                        "Create and manage your Silver Diamond projects.",
+                        13.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.panel_title, 286.0f, 154.0f, 800.0f, 28.0f,
+                        "New project", 18.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.panel_subtitle, 286.0f, 189.0f, 850.0f, 20.0f,
+                        "Choose a template and configure your project settings.",
+                        12.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.template_category, 362.0f, 264.0f, 140.0f, 24.0f,
+                        "3D / C", 11.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.template_name, 304.0f, 326.0f, 190.0f, 28.0f,
+                        "Empty Project", 15.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.template_detail, 304.0f, 356.0f, 190.0f, 18.0f,
+                        "SILVER DIAMOND CORE", 10.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.template_description, 304.0f, 406.0f, 190.0f, 44.0f,
+                        "Window and input loop", 12.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.settings_heading, 546.0f, 246.0f, 500.0f, 20.0f,
+                        "PROJECT SETTINGS", 11.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.name_label, 546.0f, 292.0f, 500.0f, 24.0f,
+                        "Project name", 12.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.location_label, 546.0f, 388.0f, 500.0f, 24.0f,
+                        "Location", 12.0f, COLOR_TEXT);
+    sdge_gui_label_init(&hub.project_preview, 546.0f, 464.0f, 500.0f, 20.0f,
+                        "Project folder: Projects/MyGame", 11.0f, COLOR_MUTED);
+    sdge_gui_label_init(&hub.status, 286.0f, 682.0f, 700.0f, 44.0f,
+                        "Select a location and name to begin.", 12.0f,
+                        COLOR_MUTED);
+    sdge_gui_label_init(&hub.footer, 286.0f, 728.0f, 900.0f, 20.0f,
+                        "Starter files: src/main.c, README.md, and assets/",
+                        11.0f, COLOR_MUTED);
 
-    /* ------------------------------------------------------------ the gui */
-    g.gui = sdge_gui_create();
-    if (g.gui) {
-        float mw = (float)g.fbw * 0.5f;
-        float fx = (float)g.fbw - 300.0f;
+    sdge_gui_input_init(&hub.name_input, 0.0f, 0.0f, 500.0f, 38.0f,
+                        "MyGame");
+    sdge_gui_input_set_text(&hub.name_input, "MyGame");
+    hub.name_input.on_change = on_project_settings_changed;
+    sdge_gui_input_init(&hub.location_input, 0.0f, 0.0f, 500.0f, 38.0f,
+                        "Projects");
+    sdge_gui_input_set_text(&hub.location_input, "Projects");
+    hub.location_input.on_change = on_project_settings_changed;
+    sdge_gui_button_init(&hub.create_button, 0.0f, 0.0f, 148.0f, 42.0f,
+                         "Create project", create_project, NULL);
+    style_primary_button(&hub.create_button);
+    sdge_gui_button_init(&hub.quit_button, 0.0f, 0.0f, 120.0f, 42.0f,
+                         "Exit Hub", quit_hub, NULL);
+    hub.quit_button.text_size = 13.0f;
+    hub.quit_button.radius = 5.0f;
+    hub.quit_button.shadow_color[3] = 0.0f;
+    update_project_preview();
 
-        sdge_gui_div_init(&g.menu_panel, mw - 230.0f, 60.0f, 460.0f, 340.0f,
-                          C_PANEL);
-        g.menu_panel.border_color[0] = C_PANEL_B[0];
-        g.menu_panel.border_color[1] = C_PANEL_B[1];
-        g.menu_panel.border_color[2] = C_PANEL_B[2];
-        g.menu_panel.border_color[3] = C_PANEL_B[3];
-        g.menu_panel.border_width = 1.0f;
-        g.menu_panel.shadow_color[3] = C_SHADOW[3];
+    add_widget(&hub.sidebar.base);
+    add_widget(&hub.nav_selected.base);
+    add_widget(&hub.nav_indicator.base);
+    add_widget(&hub.panel.base);
+    add_widget(&hub.template_card.base);
+    add_widget(&hub.template_icon.base);
+    add_widget(&hub.logo_mark.base);
+    add_widget(&hub.brand.base);
+    add_widget(&hub.brand_subtitle.base);
+    add_widget(&hub.nav_section.base);
+    add_widget(&hub.nav_projects.base);
+    add_widget(&hub.sidebar_version.base);
+    add_widget(&hub.title.base);
+    add_widget(&hub.subtitle.base);
+    add_widget(&hub.panel_title.base);
+    add_widget(&hub.panel_subtitle.base);
+    add_widget(&hub.template_category.base);
+    add_widget(&hub.template_name.base);
+    add_widget(&hub.template_detail.base);
+    add_widget(&hub.template_description.base);
+    add_widget(&hub.settings_heading.base);
+    add_widget(&hub.name_label.base);
+    add_widget(&hub.name_input.base);
+    add_widget(&hub.location_label.base);
+    add_widget(&hub.location_input.base);
+    add_widget(&hub.project_preview.base);
+    add_widget(&hub.create_button.base);
+    add_widget(&hub.quit_button.base);
+    add_widget(&hub.status.base);
+    add_widget(&hub.footer.base);
+    layout_widgets();
 
-        sdge_gui_div_init(&g.world_panel, 20.0f, 20.0f, 260.0f, 132.0f, C_PANEL);
-        g.world_panel.border_color[3] = C_PANEL_B[3];
-        g.world_panel.border_width = 1.0f;
-        g.world_panel.radius = 10.0f;
+    sdge_set_key_callback(hub.window, on_key);
+    sdge_set_char_callback(hub.window, on_char);
+    sdge_set_mouse_button_callback(hub.window, on_mouse_button);
+    sdge_set_cursor_pos_callback(hub.window, on_cursor);
+    sdge_set_window_size_callback(hub.window, on_size);
 
-        sdge_gui_div_init(&g.phys_panel, 20.0f, 20.0f, 260.0f, 132.0f, C_PANEL);
-        g.phys_panel.border_color[3] = C_PANEL_B[3];
-        g.phys_panel.border_width = 1.0f;
-        g.phys_panel.radius = 10.0f;
-
-        sdge_gui_div_init(&g.credits_panel, mw - 230.0f, 80.0f, 460.0f, 300.0f,
-                          C_PANEL);
-        g.credits_panel.border_color[3] = C_PANEL_B[3];
-        g.credits_panel.border_width = 1.0f;
-
-        /* the buttons */
-        sdge_gui_button_init(&g.btn_play, mw - 90.0f, 186.0f, 180.0f, 38.0f,
-                             "WORLD", act_play, NULL);
-        sdge_gui_button_init(&g.btn_phys, mw - 90.0f, 232.0f, 180.0f, 38.0f,
-                             "PHYSICS 3D", act_phys3d, NULL);
-        sdge_gui_button_init(&g.btn_phys2d, mw - 90.0f, 278.0f, 180.0f, 34.0f,
-                             "PHYSICS 2D", act_phys2d, NULL);
-        sdge_gui_button_init(&g.btn_credits, mw - 90.0f, 320.0f, 180.0f, 34.0f,
-                             "CREDITS", act_credits, NULL);
-        sdge_gui_button_init(&g.btn_quit, mw - 90.0f, 358.0f, 180.0f, 34.0f,
-                             "QUIT", act_quit, NULL);
-        sdge_gui_button_init(&g.btn_back, mw - 80.0f, 400.0f, 160.0f, 36.0f,
-                             "BACK", act_back, NULL);
-        sdge_gui_button_init(&g.btn_idle, 20.0f, (float)g.fbh - 56.0f, 110.0f,
-                             38.0f, "IDLE", act_idle, NULL);
-        sdge_gui_button_init(&g.btn_wave, 140.0f, (float)g.fbh - 56.0f, 110.0f,
-                             38.0f, "WAVE", act_wave, NULL);
-        sdge_gui_button_init(&g.btn_menu, 260.0f, (float)g.fbh - 56.0f, 110.0f,
-                             38.0f, "MENU", act_menu, NULL);
-        sdge_gui_button_init(&g.btn_spawn, 380.0f, (float)g.fbh - 56.0f, 110.0f,
-                             38.0f, "SPAWN", act_spawn, NULL);
-        sdge_gui_button_init(&g.btn_reset, 500.0f, (float)g.fbh - 56.0f, 110.0f,
-                             38.0f, "RESET", act_reset, NULL);
-
-        /* the labels */
-        sdge_gui_label_init(&g.lbl_title, mw - 200.0f, 68.0f, 400.0f, 30.0f,
-                            "SILVER DIAMOND", 22.0f, C_GOLD);
-        sdge_gui_label_init(&g.lbl_hint, mw - 200.0f, 372.0f, 400.0f, 20.0f,
-                            "1/2 anim  M mute  P music  F font  SPACE spawn",
-                            11.0f, C_MUTED);
-        sdge_gui_label_init(&g.lbl_fps, 296.0f, 24.0f, 200.0f, 20.0f, "fps",
-                            13.0f, C_TEXT);
-        sdge_gui_label_init(&g.lbl_name, mw - 90.0f, 76.0f, 180.0f, 18.0f,
-                            "pilot name", 13.0f, C_MUTED);
-        sdge_gui_label_init(&g.lbl_mode, fx, 76.0f, 200.0f, 18.0f, "options",
-                            13.0f, C_MUTED);
-        sdge_gui_label_init(&g.lbl_phys, 296.0f, 24.0f, 240.0f, 20.0f, "physics",
-                            13.0f, C_TEXT);
-        sdge_gui_label_init(&g.lbl_credits, 296.0f, 24.0f, 200.0f, 20.0f,
-                            "credits", 13.0f, C_TEXT);
-
-        /* the input */
-        sdge_gui_input_init(&g.name_input, mw - 90.0f, 140.0f, 180.0f, 30.0f,
-                            "pilot name");
-        g.name_input.on_change = on_name_changed;
-
-        /* the checkbox */
-        sdge_gui_checkbox_init(&g.chk_sound, fx, 96.0f, 16.0f, "sound", 1);
-        g.chk_sound.on_change = on_sound_changed;
-        sdge_gui_checkbox_init(&g.chk_shadows, fx, 122.0f, 16.0f, "shadows", 1);
-        g.chk_shadows.on_change = on_shadows_changed;
-
-        /* the progress bar */
-        sdge_gui_progress_init(&g.prog_load, fx, 152.0f, 200.0f, 10.0f);
-        sdge_gui_progress_set(&g.prog_load, 0.65f);
-
-        /* the slider */
-        sdge_gui_slider_init(&g.sld_zoom, fx, 180.0f, 200.0f, 22.0f, 0.2f);
-        g.sld_zoom.on_change = on_zoom_changed;
-        g.sld_zoom.fill_color[0] = C_ACCENT[0];
-        g.sld_zoom.fill_color[1] = C_ACCENT[1];
-        g.sld_zoom.fill_color[2] = C_ACCENT[2];
-        g.sld_zoom.fill_color[3] = C_ACCENT[3];
-
-        /* the radio group */
-        sdge_gui_radio_group_init(&g.radio_group);
-        g.radio_group.on_change = on_quality_changed;
-        sdge_gui_radio_init(&g.radio_low, fx, 218.0f, 16.0f, 0, &g.radio_group);
-        sdge_gui_radio_init(&g.radio_mid, fx + 66.0f, 218.0f, 16.0f, 1,
-                            &g.radio_group);
-        sdge_gui_radio_init(&g.radio_high, fx + 136.0f, 218.0f, 16.0f, 2,
-                            &g.radio_group);
-        strcpy(g.radio_low.label, "low");
-        strcpy(g.radio_mid.label, "mid");
-        strcpy(g.radio_high.label, "high");
-
-        /* the list box */
-        sdge_gui_listbox_init(&g.list_scenes, fx, 252.0f, 200.0f, 110.0f);
-        sdge_gui_listbox_add(&g.list_scenes, "menu");
-        sdge_gui_listbox_add(&g.list_scenes, "world");
-        sdge_gui_listbox_add(&g.list_scenes, "physics 3d");
-        sdge_gui_listbox_add(&g.list_scenes, "physics 2d");
-        sdge_gui_listbox_add(&g.list_scenes, "credits");
-        g.list_scenes.on_select = on_scene_picked;
-
-        /* register everything */
-        sdge_gui_add(g.gui, &g.menu_panel.base);
-        sdge_gui_add(g.gui, &g.world_panel.base);
-        sdge_gui_add(g.gui, &g.phys_panel.base);
-        sdge_gui_add(g.gui, &g.credits_panel.base);
-        sdge_gui_add(g.gui, &g.name_input.base);
-        sdge_gui_add(g.gui, &g.btn_play.base);
-        sdge_gui_add(g.gui, &g.btn_phys.base);
-        sdge_gui_add(g.gui, &g.btn_phys2d.base);
-        sdge_gui_add(g.gui, &g.btn_credits.base);
-        sdge_gui_add(g.gui, &g.btn_quit.base);
-        sdge_gui_add(g.gui, &g.btn_back.base);
-        sdge_gui_add(g.gui, &g.btn_idle.base);
-        sdge_gui_add(g.gui, &g.btn_wave.base);
-        sdge_gui_add(g.gui, &g.btn_menu.base);
-        sdge_gui_add(g.gui, &g.btn_spawn.base);
-        sdge_gui_add(g.gui, &g.btn_reset.base);
-        sdge_gui_add(g.gui, &g.chk_sound.base);
-        sdge_gui_add(g.gui, &g.chk_shadows.base);
-        sdge_gui_add(g.gui, &g.prog_load.base);
-        sdge_gui_add(g.gui, &g.sld_zoom.base);
-        sdge_gui_add(g.gui, &g.radio_low.base);
-        sdge_gui_add(g.gui, &g.radio_mid.base);
-        sdge_gui_add(g.gui, &g.radio_high.base);
-        sdge_gui_add(g.gui, &g.list_scenes.base);
-        sdge_gui_add(g.gui, &g.lbl_title.base);
-        sdge_gui_add(g.gui, &g.lbl_hint.base);
-        sdge_gui_add(g.gui, &g.lbl_fps.base);
-        sdge_gui_add(g.gui, &g.lbl_name.base);
-        sdge_gui_add(g.gui, &g.lbl_mode.base);
-        sdge_gui_add(g.gui, &g.lbl_phys.base);
-        sdge_gui_add(g.gui, &g.lbl_credits.base);
-    }
-
-    /* --------------------------------------------------------- the scenes */
-    g.menu_scene.name = "menu";
-    g.menu_scene.on_enter = menu_on_enter;
-    g.menu_scene.on_gui = menu_on_gui;
-
-    g.world_scene.name = "world";
-    g.world_scene.on_enter = world_on_enter;
-    g.world_scene.on_update = world_on_update;
-    g.world_scene.on_render = world_on_render;
-    g.world_scene.on_gui = world_on_gui;
-
-    g.phys3d_scene.name = "physics3d";
-    g.phys3d_scene.on_enter = phys3d_on_enter;
-    g.phys3d_scene.on_update = phys3d_on_update;
-    g.phys3d_scene.on_render = phys3d_on_render;
-    g.phys3d_scene.on_gui = phys3d_on_gui;
-
-    g.phys2d_scene.name = "physics2d";
-    g.phys2d_scene.on_enter = phys2d_on_enter;
-    g.phys2d_scene.on_update = phys2d_on_update;
-    g.phys2d_scene.on_gui = phys2d_on_gui;
-
-    g.credits_scene.name = "credits";
-    g.credits_scene.on_enter = credits_on_enter;
-    g.credits_scene.on_gui = credits_on_gui;
-
-    sdge_scene_mgr_init(&g.scenes);
-    sdge_scene_mgr_add(&g.scenes, &g.menu_scene);
-    sdge_scene_mgr_add(&g.scenes, &g.world_scene);
-    sdge_scene_mgr_add(&g.scenes, &g.phys3d_scene);
-    sdge_scene_mgr_add(&g.scenes, &g.phys2d_scene);
-    sdge_scene_mgr_add(&g.scenes, &g.credits_scene);
-    if (start_scene < 0 || start_scene > 4) start_scene = 0;
-    sdge_scene_mgr_switch_now(&g.scenes, start_scene);
-    for (int d = 0; d < auto_drops; ++d) act_spawn(NULL);
-
-    set_title();
-    g.last_time = sdge_get_time();
-
-    /* ------------------------------------------------------- the main loop */
-    while (!sdge_window_should_close(g.win)) {
+    while (!sdge_window_should_close(hub.window)) {
         sdge_poll_events();
+        sdgr_resize(hub.width, hub.height);
+        sdgr_begin_frame(HUB_COLOR_BACKGROUND);
+        sdgr_end_frame();
 
-        double now = sdge_get_time();
-        /* in the screenshot mode the loop runs as fast as it can, so the real
-         * delta would be a fraction of a millisecond; use a fixed step there
-         * to make the shots deterministic (and to let the physics settle) */
-        float dt = shot_frame ? (1.0f / 60.0f) : (float)(now - g.last_time);
-        g.last_time = now;
-        if (dt > 0.1f) dt = 0.1f;
-
-        g.fps_accum += dt;
-        g.fps_frames++;
-        if (g.fps_accum >= 0.5f) {
-            g.fps_display = (int)(g.fps_frames / g.fps_accum + 0.5);
-            g.fps_frames = 0;
-            g.fps_accum = 0.0;
-            set_title();
-        }
-
-        /* the camera */
-        sdge_camera3d_set_aspect(&g.cam, (float)g.fbw / (float)g.fbh);
-        sdge_camera3d_orbit(&g.cam, g.cam_center, g.cam_dist,
-                            g.cam_yaw, g.cam_pitch);
-        sdge_camera3d_update(&g.cam);
-        sdge_camera2d_set_viewport(&g.cam2d, g.fbw, g.fbh);
-        sdge_camera2d_update(&g.cam2d);
-
-        /* the audio: the listener is the camera */
-        float cam_pos[3] = { g.cam.pos[0], g.cam.pos[1], g.cam.pos[2] };
-        float cam_fwd[3];
-        sdge_camera3d_forward(&g.cam, cam_fwd);
-        sdge_audio_listener_position(cam_pos[0], cam_pos[1], cam_pos[2]);
-        sdge_audio_listener_orientation(cam_fwd[0], cam_fwd[1], cam_fwd[2],
-                                        0.0f, 1.0f, 0.0f);
-        if (g.beep_src) {
-            float a = (float)now * 0.8f;
-            sdge_audio_source_set_position(g.beep_src,
-                                           cosf(a) * 2.5f, 1.2f, sinf(a) * 2.5f);
-        }
-
-        if (g.character) sdge_model_advance(g.character, dt);
-
-        /* the scenes */
-        sdge_scene_mgr_update(&g.scenes, dt);
-
-        /* the world */
-        if (gl_ok) {
-            sdgr_resize(g.fbw, g.fbh);
-            float clear[4] = { 0.05f, 0.06f, 0.09f, 1.0f };
-            sdgr_begin_frame(clear);
-            sdgr_set_camera(g.cam.view, g.cam.proj, cam_pos);
-            sdge_ambient_light_apply(&g.ambient);
-            sdge_sun_apply(&g.sun);
-            sdge_point_light_apply(&g.lamp, 0);
-            sdge_scene_mgr_render(&g.scenes);
-            sdgr_end_frame();
-        }
-
-        /* the gui */
-        if (ui_ok && g.gui) {
-            sdge_gui_begin(g.gui, g.fbw, g.fbh);
-            sdge_gui_draw(g.gui);
-            sdge_scene_mgr_render_gui(&g.scenes, g.gui);
-            sdge_gui_end(g.gui);
-        }
-
-        if (gl_ok && shot_frame && ++frame_no >= shot_frame) {
-            int rc = sdgr_screenshot(shot_path);
-            fprintf(stderr, "demo: screenshot '%s' %s\n", shot_path,
-                    rc == 0 ? "saved" : "FAILED");
-            sdge_set_window_should_close(g.win, true);
-        }
-
-        sdge_swap_buffers(g.win);
+        sdge_gui_begin(hub.gui, hub.width, hub.height);
+        sdge_gui_draw(hub.gui);
+        sdge_gui_end(hub.gui);
+        sdge_swap_buffers(hub.window);
     }
 
-    /* ------------------------------------------------------------- cleanup */
-    if (g.gui) sdge_gui_destroy(g.gui);
-    sdga_free_font(g.font_ttf);
-    sdga_free_font(g.font_otf);
-    if (g.music_src) sdge_audio_source_destroy(g.music_src);
-    if (g.music)     sdge_audio_free_buffer(g.music);
-    if (g.beep_src) sdge_audio_source_destroy(g.beep_src);
-    if (g.beep)     sdge_audio_free_buffer(g.beep);
-    sdge_audio_terminate();
-    if (g.floor)     sdge_model_destroy(g.floor);
-    if (g.character) sdge_model_destroy(g.character);
-    sdge_mesh_destroy(&g.box_mesh);
-    sdge_mesh_destroy(&g.sphere_mesh);
-    sdph3_world_destroy(g.phys3);
-    sdph2_world_destroy(g.phys2);
+    sdge_gui_destroy(hub.gui);
     sdui_shutdown();
     sdgr_shutdown();
-    sdge_destroy_window(g.win);
+    sdge_destroy_window(hub.window);
     sdge_terminate();
     return 0;
 }

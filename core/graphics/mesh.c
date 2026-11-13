@@ -101,6 +101,20 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
         out->has_texcoords = 1;
     }
 
+    /* TEXCOORD_1 -> attribute 5 (aUV1) */
+    if (prim->texcoords1.count > 0 && prim->texcoords1.comps == 2
+        && prim->texcoords1.count == prim->positions.count) {
+        m_upload_attrib(&out->vbo_tex1, 5, 2, &prim->texcoords1);
+        out->has_texcoords2 = 1;
+    }
+
+    /* TANGENT -> attribute 6 (aTan, xyz + handedness) */
+    if (prim->tangents.count > 0 && prim->tangents.comps == 4
+        && prim->tangents.count == prim->positions.count) {
+        m_upload_attrib(&out->vbo_tan, 6, 4, &prim->tangents);
+        out->has_tangents = 1;
+    }
+
     /* joints + weights interleaved as 8 floats (joint, weight) x4 */
     if (prim->joints.count > 0 && prim->weights.count > 0
         && prim->joints.comps == 4 && prim->weights.comps == 4
@@ -338,6 +352,8 @@ SDGE_API void sdge_mesh_destroy(sdge_mesh *m) {
     if (m->vbo_pos)  glDeleteBuffers(1, &m->vbo_pos);
     if (m->vbo_nrm)  glDeleteBuffers(1, &m->vbo_nrm);
     if (m->vbo_tex)  glDeleteBuffers(1, &m->vbo_tex);
+    if (m->vbo_tex1) glDeleteBuffers(1, &m->vbo_tex1);
+    if (m->vbo_tan)  glDeleteBuffers(1, &m->vbo_tan);
     if (m->vbo_skin) glDeleteBuffers(1, &m->vbo_skin);
     if (m->ebo)      glDeleteBuffers(1, &m->ebo);
     memset(m, 0, sizeof(*m));

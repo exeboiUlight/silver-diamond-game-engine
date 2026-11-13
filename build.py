@@ -14,8 +14,9 @@ Usage:
     python build.py run           build, then run the app
     python build.py rebuild       clean + build
     python build.py clean         remove the whole build/ directory
-    python build.py test          run the test suite (tests/run_tests.py)
     python build.py sdk           build the engine and export the C SDK to API/
+    python build.py demo --demo NAME
+                                  build demos/NAME.c into an executable
 
 Options:
     --debug         build with -O0 -g (default is release: -O2 -DNDEBUG)
@@ -33,6 +34,7 @@ Source lists live in python configs (add files there, not here):
 Output of build (split by host platform AND variant, so a Windows build
 never clashes with a WSL build of the same project directory):
     build/<platform>/<variant>/obj/*.o + *.d        objects + dependency files
+    build/<platform>/<variant>/API/                 copied SDK
     <platform> is "windows" or "linux", <variant> is release|release_nogl|debug|...
 
 Incremental rules: an object is rebuilt when its source file changes OR when
@@ -269,13 +271,14 @@ class Main:
             print(r.stderr.rstrip())
         return True
 
-    def link_app(self, objs):
+    def link_app(self, objs, out=None):
+        target = out or self.out
         if self.is_windows:
-            cmd = [self.cc, *objs, "-o", self.out, self.implib]
+            cmd = [self.cc, *objs, "-o", target, self.implib]
         else:
             # rpath $ORIGIN: the exe finds libsdge.so next to itself
             # -lm: gcc folds sinf+cosf into sincosf(), which lives in libm
-            cmd = [self.cc, *objs, "-o", self.out,
+            cmd = [self.cc, *objs, "-o", target,
                    f"-L{self.build_dir}", "-lsdge", "-Wl,-rpath,$ORIGIN", "-lm"]
         print("[build] ld:", " ".join(shlex.quote(c) for c in cmd))
         r = subprocess.run(cmd, capture_output=True, text=True,
@@ -283,7 +286,7 @@ class Main:
         if r.returncode != 0:
             print(r.stdout)
             print(r.stderr)
-            print(f"[build] FAILED to link {self.out}")
+            print(f"[build] FAILED to link {target}")
             return False
         if r.stderr.strip():
             print(r.stderr.rstrip())
@@ -376,6 +379,59 @@ class Main:
                   f" up to date)")
         else:
             print(f"[build] {self.out} is up to date ({len(app_objs)} objects)")
+        if not self.copy_api_to_release():
+            return False
+        return True
+
+    def build_demo(self, name):
+        """builds demos/<name>.c into an executable next to the engine"""
+        if not self.cc:
+            print("[build] ERROR: no C compiler found")
+            return False
+        src = f"demos/{name}.c"
+        if not os.path.isfile(self.abspath(src)):
+            print(f"[build] ERROR: demo source not found: {src}")
+            return False
+
+        if not self.build(build_app=False):
+            return False
+
+        obj = self.obj_of(src)
+        os.makedirs(self.abspath(self.obj_dir), exist_ok=True)
+        if self.is_stale(src, obj):
+            if not self.compile(src, third_party=False, engine=False):
+                return False
+        out = os.path.join(self.build_dir,
+                           name + (".exe" if self.is_windows else ""))
+        if not self.link_app([obj], out):
+            return False
+        print(f"[build] built {out}")
+        return True
+
+    def copy_api_to_release(self):
+        source = self.abspath("API")
+        target = self.abspath(os.path.join(self.build_dir, "API"))
+        if not os.path.isdir(source):
+            print(f"[build] ERROR: SDK directory not found: {source}")
+            return False
+
+        def raise_walk_error(error):
+            raise error
+
+        try:
+            for current, _, files in os.walk(source, onerror=raise_walk_error):
+                relative = os.path.relpath(current, source)
+                destination_dir = target if relative == "." else \
+                    os.path.join(target, relative)
+                os.makedirs(destination_dir, exist_ok=True)
+                for name in files:
+                    shutil.copy2(os.path.join(current, name),
+                                 os.path.join(destination_dir, name))
+        except OSError as exc:
+            print(f"[build] ERROR: cannot copy SDK to {target}: {exc}")
+            return False
+
+        print(f"[build] copied API/ to {os.path.join(self.build_dir, 'API')}")
         return True
 
     def export_sdk(self):
@@ -439,16 +495,6 @@ class Main:
         print("[build] removed build/")
         return True
 
-    def test(self):
-        script = os.path.join("tests", "run_tests.py")
-        if not os.path.isfile(self.abspath(script)):
-            print("[test] ERROR: tests/run_tests.py not found")
-            return False
-        print("[test] running tests/run_tests.py ...\n")
-        r = subprocess.run([sys.executable, script], cwd=ROOT)
-        return r.returncode == 0
-
-
 # ----------------------------------------------------------------- wsl glue
 def run_in_wsl():
     if os.name != "nt":
@@ -477,7 +523,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Silver Diamond Game Engine build script")
     ap.add_argument("command", nargs="?", default="build",
-                    choices=["build", "run", "rebuild", "clean", "test", "sdk"],
+                    choices=["build", "run", "rebuild", "clean", "sdk", "demo"],
                     help="what to do (default: build)")
     ap.add_argument("--debug", action="store_true",
                     help="-O0 -g build (default: -O2 -DNDEBUG)")
@@ -485,6 +531,8 @@ def main():
                     help="build without OpenGL (-DSDGE_NO_GL)")
     ap.add_argument("--name", metavar="NAME",
                     help="binary name (default: src/config.py 'name' or 'silver_diamond')")
+    ap.add_argument("--demo", metavar="NAME",
+                    help="demo program to build (source: demos/NAME.c)")
     ap.add_argument("--wsl", action="store_true",
                     help="build inside WSL instead of Windows")
     args = ap.parse_args()
@@ -501,10 +549,11 @@ def main():
         return 0 if (m.clean() and m.build()) else 1
     if args.command == "clean":
         return 0 if m.clean() else 1
-    if args.command == "test":
-        return 0 if m.test() else 1
     if args.command == "sdk":
         return 0 if m.sdk() else 1
+    if args.command == "demo":
+        name = args.demo or "texture_demo"
+        return 0 if m.build_demo(name) else 1
     return 1
 
 

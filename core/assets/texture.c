@@ -58,6 +58,25 @@ SDGE_API int sdga_image_load_rgba(const char *path, sdga_image *out) {
     return img_load_impl(path, out, 1);
 }
 
+SDGE_API int sdga_image_load_rgba_mem(const void *data, int size,
+                                      sdga_image *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!data || size <= 0) return -1;
+
+    int w = 0, h = 0, ch = 0;
+    stbi_set_flip_vertically_on_load(0);   /* glTF: top-left origin */
+    unsigned char *pixels = stbi_load_from_memory((const unsigned char *)data,
+                                                   size, &w, &h, &ch, 4);
+    if (!pixels) return -2;
+    if (w <= 0 || h <= 0) { stbi_image_free(pixels); return -3; }
+    out->w = w;
+    out->h = h;
+    out->channels = 4;
+    out->pixels = pixels;
+    return 0;
+}
+
 SDGE_API void sdga_image_free(sdga_image *img) {
     if (!img) return;
     if (img->pixels) stbi_image_free(img->pixels);

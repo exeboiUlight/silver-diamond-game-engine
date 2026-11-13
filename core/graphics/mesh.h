@@ -25,6 +25,8 @@ typedef struct sdge_mesh {
     unsigned vbo_pos;
     unsigned vbo_nrm;
     unsigned vbo_tex;        /* TEXCOORD_0, 0 when the primitive has none */
+    unsigned vbo_tex1;       /* TEXCOORD_1 */
+    unsigned vbo_tan;        /* TANGENT (xyz + handedness) */
     unsigned vbo_skin;       /* joints+weights interleaved, 0 when unskinned */
     unsigned ebo;            /* 0 when the primitive is non-indexed */
 
@@ -34,6 +36,8 @@ typedef struct sdge_mesh {
     int   has_skin;
     int   has_normals;
     int   has_texcoords;
+    int   has_texcoords2;    /* TEXCOORD_1 present */
+    int   has_tangents;
     int   double_sided;
 
     float bounds_center[3];

@@ -43,6 +43,9 @@ SDGE_API void sdge_model_stop(sdge_model *m);
 SDGE_API void sdge_model_advance(sdge_model *m, float dt);
 SDGE_API void sdge_model_set_time(sdge_model *m, float seconds);
 
+/* the raw glTF data behind the model (nodes, materials, textures, ...) */
+SDGE_API const sdge_gltf_model *sdge_model_gltf(const sdge_model *m);
+
 /* draw the whole hierarchy; `model` = additional parent transform
  * (NULL = identity). Uses the renderer's camera frustum for culling. */
 SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model);

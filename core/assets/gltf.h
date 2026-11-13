@@ -8,10 +8,12 @@
  *   - one free call releases the whole model (arena blocks).
  *
  * Supported: nodes (TRS + matrix), meshes/primitives, skins (inverse bind
- * matrices), animations (LINEAR/STEP/CUBICSPLINE on T/R/S), PBR factors,
- * baseColorTexture (images/textures/samplers, external files + GLB bufferViews).
- * Not supported (v1): morph targets (WEIGHTS), sparse accessors, Draco,
- * base64 data-URIs, PBR texture channels beyond baseColor.
+ * matrices), animations (LINEAR/STEP/CUBICSPLINE on T/R/S), full PBR
+ * materials (baseColor / metallicRoughness / normal / occlusion / emissive
+ * textures + factors, alphaMode, doubleSided, KHR_texture_transform),
+ * images/textures/samplers (external files, data-URIs, GLB bufferViews),
+ * TEXCOORD_0/1 and TANGENT vertex attributes.
+ * Not supported (v1): morph targets (WEIGHTS), sparse accessors, Draco.
  */
 #ifndef SDGE_GLTF_H
 #define SDGE_GLTF_H
@@ -56,6 +58,8 @@ typedef struct {
     sdge_accessor positions;
     sdge_accessor normals;
     sdge_accessor texcoords;   /* TEXCOORD_0 */
+    sdge_accessor texcoords1;  /* TEXCOORD_1 */
+    sdge_accessor tangents;    /* TANGENT (VEC4: xyz + handedness) */
     sdge_accessor colors;      /* COLOR_0 */
     sdge_accessor joints;      /* JOINTS_0 (VEC4) */
     sdge_accessor weights;     /* WEIGHTS_0 (VEC4) */
@@ -116,7 +120,10 @@ typedef struct {
 typedef struct {
     char *name;
     char *uri;                  /* external file; NULL for GLB images */
+    int   uri_len;              /* length of uri (0 when none) */
     int   buffer_view;          /* glTF image.bufferView, -1 if none */
+    const unsigned char *data;  /* decoded "data:" URI payload (arena owned) */
+    int   data_len;
     char *mime_type;            /* "image/png", "image/jpeg", NULL */
 } sdge_gltf_image;
 
@@ -131,15 +138,37 @@ typedef struct {
     int wrap_s, wrap_t;
 } sdge_gltf_sampler;
 
+/* alpha handling of a material */
+#define SDGE_ALPHA_OPAQUE 0      /* fully opaque */
+#define SDGE_ALPHA_MASK   1      /* alpha test against alpha_cutoff */
+#define SDGE_ALPHA_BLEND  2      /* alpha blending */
+
+/* a reference to one texture slot of a material (glTF "textureInfo") */
+typedef struct {
+    int index;                  /* index into model->textures, -1 = none */
+    int texcoord;               /* TEXCOORD_n set used by this slot */
+    float scale;                /* normal scale / occlusion strength */
+    int has_transform;          /* KHR_texture_transform present */
+    float offset[2];            /* transform offset */
+    float rotation;             /* transform rotation (radians) */
+    float scale_uv[2];          /* transform scale */
+} sdge_gltf_texinfo;
+
 typedef struct {
     char *name;
     float base_color[4];
     float metallic;
     float roughness;
+    float emissive[3];
     int double_sided;
-    /* NEW: */
-    int base_color_texture;     /* index into textures, -1 = none */
-    int base_color_texcoord;    /* TEXCOORD_n, usually 0 */
+    int alpha_mode;             /* SDGE_ALPHA_* */
+    float alpha_cutoff;
+
+    sdge_gltf_texinfo base_color_tex;
+    sdge_gltf_texinfo metallic_roughness_tex;
+    sdge_gltf_texinfo normal_tex;
+    sdge_gltf_texinfo occlusion_tex;
+    sdge_gltf_texinfo emissive_tex;
 } sdge_gltf_material;
 
 typedef struct {
@@ -305,11 +334,128 @@ static float *g_accessor_to_f32(sdge_gltf_model *m, const sdge_accessor *a) {
     return out;
 }
 
+/* raw (not copied, not NUL-terminated) string value of a token */
+static const char *g_str_raw(const sdj_doc *d, int t, int *len_out) {
+    if (t < 0 || t >= d->count || d->tok[t].type != SDJ_STRING) return NULL;
+    if (len_out) *len_out = d->tok[t].end - d->tok[t].start;
+    return d->src + d->tok[t].start;
+}
+
 static char *g_str(sdge_gltf_model *m, const sdj_doc *d, int t) {
     char tmp[256];
     int n = sdj_str(d, t, tmp, (int)sizeof(tmp));
     if (n < 0) return NULL;
     return sdga_strdup(&m->arena, tmp);
+}
+
+/* duplicates a string token of ANY length into the arena (data-URIs can be
+ * megabytes long, so the 256-byte helper above must not be used for them) */
+static char *g_strdup_raw(sdge_gltf_model *m, const sdj_doc *d, int t,
+                          int *len_out) {
+    int len = 0;
+    const char *raw = g_str_raw(d, t, &len);
+    if (!raw) return NULL;
+    char *out = (char *)sdga_alloc(&m->arena, (size_t)len + 1u);
+    if (!out) return NULL;
+    memcpy(out, raw, (size_t)len);
+    out[len] = '\0';
+    if (len_out) *len_out = len;
+    return out;
+}
+
+/* ---------------------------------------------------------------- base64
+ * glTF allows "data:<mime>;base64,<payload>" URIs for buffers and images.
+ * The decoder is allocation-light: it returns a malloc'ed buffer the caller
+ * frees (or NULL on malformed input). */
+static int g_b64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static unsigned char *g_base64_decode(const char *src, size_t srclen,
+                                      size_t *out_len) {
+    unsigned char *out = (unsigned char *)malloc(srclen / 4u * 3u + 4u);
+    if (!out) return NULL;
+    size_t o = 0;
+    int acc = 0, bits = 0;
+    for (size_t i = 0; i < srclen; ++i) {
+        char c = src[i];
+        if (c == '=' ) break;
+        int v = g_b64_value(c);
+        if (v < 0) continue;                 /* skip whitespace/newlines */
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (unsigned char)((acc >> bits) & 0xFF);
+        }
+    }
+    *out_len = o;
+    return out;
+}
+
+/* decodes "data:...;base64,<payload>" - returns NULL when not a data URI */
+static unsigned char *g_data_uri_decode(const char *uri, size_t urilen,
+                                        size_t *out_len) {
+    if (!uri || urilen < 5 || strncmp(uri, "data:", 5) != 0) return NULL;
+    const char *comma = (const char *)memchr(uri, ',', urilen);
+    if (!comma) return NULL;
+    size_t headlen = (size_t)(comma - uri) - 5;
+    const char *head = uri + 5;
+    int is_b64 = (headlen >= 7 && strncmp(head + headlen - 7, ";base64", 7) == 0);
+    if (!is_b64) return NULL;                /* plain (percent) data URIs */
+    const char *payload = comma + 1;
+    size_t plen = urilen - (size_t)(payload - uri);
+    return g_base64_decode(payload, plen, out_len);
+}
+
+/* ------------------------------------------------------------- textureInfo
+ * parses {"index":n, "texCoord":k, "scale":s, "extensions":{...}} */
+static void g_parse_texinfo(sdj_doc *d, int tok, int texture_count,
+                            sdge_gltf_texinfo *out) {
+    memset(out, 0, sizeof(*out));
+    out->index = -1;
+    out->texcoord = 0;
+    out->scale = 1.0f;
+    out->offset[0] = out->offset[1] = 0.0f;
+    out->scale_uv[0] = out->scale_uv[1] = 1.0f;
+    if (tok < 0) return;
+
+    int idx = sdj_obj_get(d, tok, "index");
+    if (idx >= 0) {
+        int v = (int)sdj_num(d, idx);
+        out->index = (v >= 0 && v < texture_count) ? v : -1;
+    }
+    int tc = sdj_obj_get(d, tok, "texCoord");
+    if (tc >= 0) {
+        int v = (int)sdj_num(d, tc);
+        out->texcoord = (v >= 0 && v <= 7) ? v : 0;
+    }
+    int sc = sdj_obj_get(d, tok, "scale");
+    if (sc >= 0) out->scale = (float)sdj_num(d, sc);
+
+    /* KHR_texture_transform: offset / rotation / scale */
+    int ext = sdj_obj_get(d, tok, "extensions");
+    int ktt = sdj_obj_get(d, ext, "KHR_texture_transform");
+    if (ktt >= 0) {
+        out->has_transform = 1;
+        int o = sdj_obj_get(d, ktt, "offset");
+        if (sdj_len(d, o) == 2) {
+            out->offset[0] = (float)sdj_num(d, sdj_arr_at(d, o, 0));
+            out->offset[1] = (float)sdj_num(d, sdj_arr_at(d, o, 1));
+        }
+        int r = sdj_obj_get(d, ktt, "rotation");
+        if (r >= 0) out->rotation = (float)sdj_num(d, r);
+        int s = sdj_obj_get(d, ktt, "scale");
+        if (sdj_len(d, s) == 2) {
+            out->scale_uv[0] = (float)sdj_num(d, sdj_arr_at(d, s, 0));
+            out->scale_uv[1] = (float)sdj_num(d, sdj_arr_at(d, s, 1));
+        }
+    }
 }
 
 SDGE_API void sdge_gltf_destroy(sdge_gltf_model *m) {
@@ -327,8 +473,27 @@ static int g_load_buffer0(sdj_doc *d, const char *gltf_path,
     if (uri < 0) return -2;
 
     char ubuf[512];
-    if (sdj_str(d, uri, ubuf, (int)sizeof(ubuf)) < 0) return -3;
-    if (!strncmp(ubuf, "data:", 5)) return -4;
+    int ulen = 0;
+    const char *raw = g_str_raw(d, uri, &ulen);
+    if (!raw) return -3;
+
+    /* "data:...;base64,..." - decode straight into the arena */
+    if (ulen > 5 && !strncmp(raw, "data:", 5)) {
+        size_t len = 0;
+        unsigned char *dec = g_data_uri_decode(raw, (size_t)ulen, &len);
+        if (!dec || len == 0) { free(dec); return -4; }
+        unsigned char *copy = (unsigned char *)sdga_alloc(&m->arena, len);
+        if (!copy) { free(dec); return -7; }
+        memcpy(copy, dec, len);
+        free(dec);
+        bufs->bin = copy;
+        bufs->bin_len = len;
+        return 0;
+    }
+
+    if (ulen > (int)sizeof(ubuf) - 1) return -3;
+    memcpy(ubuf, raw, (size_t)ulen);
+    ubuf[ulen] = '\0';
 
     char path[1024];
     const char *slash = strrchr(gltf_path, '/');
@@ -606,6 +771,8 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                     if      (!strcmp(key, "POSITION"))  dst = &prim->positions;
                     else if (!strcmp(key, "NORMAL"))    dst = &prim->normals;
                     else if (!strcmp(key, "TEXCOORD_0")) dst = &prim->texcoords;
+                    else if (!strcmp(key, "TEXCOORD_1")) dst = &prim->texcoords1;
+                    else if (!strcmp(key, "TANGENT"))   dst = &prim->tangents;
                     else if (!strcmp(key, "COLOR_0"))    dst = &prim->colors;
                     else if (!strcmp(key, "JOINTS_0"))  dst = &prim->joints;
                     else if (!strcmp(key, "WEIGHTS_0")) dst = &prim->weights;
@@ -760,7 +927,28 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                 int bv = sdj_obj_get(&doc, it, "bufferView");
                 if (bv >= 0) im->buffer_view = (int)sdj_num(&doc, bv);
                 int uri = sdj_obj_get(&doc, it, "uri");
-                if (uri >= 0) im->uri = g_str(m, &doc, uri);
+                if (uri >= 0) {
+                    int ulen = 0;
+                    const char *raw = g_str_raw(&doc, uri, &ulen);
+                    if (raw && ulen > 5 && !strncmp(raw, "data:", 5)) {
+                        /* embedded base64 payload: decode it right away */
+                        size_t dlen = 0;
+                        unsigned char *dec = g_data_uri_decode(raw,
+                                                               (size_t)ulen, &dlen);
+                        if (dec && dlen > 0) {
+                            unsigned char *copy = (unsigned char *)
+                                sdga_alloc(&m->arena, dlen);
+                            if (copy) {
+                                memcpy(copy, dec, dlen);
+                                im->data = copy;
+                                im->data_len = (int)dlen;
+                            }
+                        }
+                        free(dec);
+                    } else if (raw) {
+                        im->uri = g_strdup_raw(m, &doc, uri, &im->uri_len);
+                    }
+                }
             }
         }
     }
@@ -821,11 +1009,13 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
             sdge_gltf_material *mat = &m->materials[i];
             mat->name = g_str(m, &doc, sdj_obj_get(&doc, mt, "name"));
             v4_set(mat->base_color, 1.0f, 1.0f, 1.0f, 1.0f);
+            v3_set(mat->emissive, 0.0f, 0.0f, 0.0f);
             mat->metallic = 1.0f;
             mat->roughness = 1.0f;
             mat->double_sided = 0;
-            mat->base_color_texture = -1;
-            mat->base_color_texcoord = 0;
+            mat->alpha_mode = SDGE_ALPHA_OPAQUE;
+            mat->alpha_cutoff = 0.5f;
+
             int pbr = sdj_obj_get(&doc, mt, "pbrMetallicRoughness");
             int bc = sdj_obj_get(&doc, pbr, "baseColorFactor");
             if (sdj_len(&doc, bc) == 4)
@@ -836,16 +1026,39 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
             if (mf >= 0) mat->metallic  = (float)sdj_num(&doc, mf);
             int rf = sdj_obj_get(&doc, pbr, "roughnessFactor");
             if (rf >= 0) mat->roughness = (float)sdj_num(&doc, rf);
+
             int ds = sdj_obj_get(&doc, mt, "doubleSided");
             if (ds >= 0) mat->double_sided = (doc.src[doc.tok[ds].start] == 't');
-            int bct = sdj_obj_get(&doc, pbr, "baseColorTexture");
-            if (bct >= 0) {
-                int idx = (int)sdj_num(&doc, sdj_obj_get(&doc, bct, "index"));
-                int texcoord = (int)sdj_num(&doc, sdj_obj_get(&doc, bct, "texCoord"));
-                mat->base_color_texture = (idx >= 0 && idx < m->texture_count)
-                                        ? idx : -1;
-                mat->base_color_texcoord = texcoord >= 0 ? texcoord : 0;
+
+            int ef = sdj_obj_get(&doc, mt, "emissiveFactor");
+            if (sdj_len(&doc, ef) == 3)
+                for (int k = 0; k < 3; ++k)
+                    mat->emissive[k] = (float)sdj_num(&doc,
+                                                     sdj_arr_at(&doc, ef, k));
+
+            int am = sdj_obj_get(&doc, mt, "alphaMode");
+            if (am >= 0) {
+                char abuf[16];
+                sdj_str(&doc, am, abuf, (int)sizeof(abuf));
+                if      (!strcmp(abuf, "MASK"))  mat->alpha_mode = SDGE_ALPHA_MASK;
+                else if (!strcmp(abuf, "BLEND")) mat->alpha_mode = SDGE_ALPHA_BLEND;
+                else                             mat->alpha_mode = SDGE_ALPHA_OPAQUE;
             }
+            int ac = sdj_obj_get(&doc, mt, "alphaCutoff");
+            if (ac >= 0) mat->alpha_cutoff = (float)sdj_num(&doc, ac);
+
+            /* ---- texture slots ---- */
+            g_parse_texinfo(&doc, sdj_obj_get(&doc, pbr, "baseColorTexture"),
+                            m->texture_count, &mat->base_color_tex);
+            g_parse_texinfo(&doc,
+                            sdj_obj_get(&doc, pbr, "metallicRoughnessTexture"),
+                            m->texture_count, &mat->metallic_roughness_tex);
+            g_parse_texinfo(&doc, sdj_obj_get(&doc, mt, "normalTexture"),
+                            m->texture_count, &mat->normal_tex);
+            g_parse_texinfo(&doc, sdj_obj_get(&doc, mt, "occlusionTexture"),
+                            m->texture_count, &mat->occlusion_tex);
+            g_parse_texinfo(&doc, sdj_obj_get(&doc, mt, "emissiveTexture"),
+                            m->texture_count, &mat->emissive_tex);
         }
     }
 
