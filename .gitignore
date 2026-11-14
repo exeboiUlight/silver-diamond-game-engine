@@ -2,7 +2,7 @@
 API
 build
 bin
-__pycache__
+__pycache__/
 audio_mix.wav
 API/lib/
 out/
