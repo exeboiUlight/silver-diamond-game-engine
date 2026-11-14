@@ -177,6 +177,29 @@ static const char *R_FS =
 "    frag = vec4(col, outA);\n"
 "}\n";
 
+static const char *R_LINE_VS =
+"#version 330 core\n"
+"layout(location=0) in vec3 aPos;\n"
+"uniform mat4 uProj, uView;\n"
+"void main() {\n"
+"    gl_Position = uProj * uView * vec4(aPos, 1.0);\n"
+"}\n";
+
+static const char *R_LINE_FS =
+"#version 330 core\n"
+"uniform vec4 uColor;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    frag = uColor;\n"
+"}\n";
+
+typedef struct {
+    unsigned prog;
+    int loc_proj, loc_view, loc_color;
+    unsigned vbo;
+    int    vbo_cap;
+} r_lines;
+
 typedef struct {
     unsigned prog;
     int loc_proj, loc_view, loc_model, loc_joints, loc_skinned;
@@ -192,6 +215,8 @@ typedef struct {
     float view[16], proj[16], cam_pos[3];
     float frustum[6][4];
     int   point_count;
+
+    r_lines lines;
 } r_state;
 
 static r_state g_r;
@@ -284,6 +309,32 @@ SDGE_API int sdgr_init(void) {
     g_r.loc_uvxform = glGetUniformLocation(prog, "uUVXform[0]");
     g_r.loc_uvset  = glGetUniformLocation(prog, "uUVSet[0]");
 
+    /* the line program (the gizmos of the scene editor) */
+    {
+        unsigned vs = r_compile(GL_VERTEX_SHADER, R_LINE_VS);
+        unsigned fs = r_compile(GL_FRAGMENT_SHADER, R_LINE_FS);
+        if (vs && fs) {
+            unsigned lp = glCreateProgram();
+            glAttachShader(lp, vs);
+            glAttachShader(lp, fs);
+            glLinkProgram(lp);
+            int lok = 0;
+            glGetProgramiv(lp, GL_LINK_STATUS, &lok);
+            if (lok) {
+                g_r.lines.prog = lp;
+                g_r.lines.loc_proj = glGetUniformLocation(lp, "uProj");
+                g_r.lines.loc_view = glGetUniformLocation(lp, "uView");
+                g_r.lines.loc_color = glGetUniformLocation(lp, "uColor");
+                glGenBuffers(1, &g_r.lines.vbo);
+                g_r.lines.vbo_cap = 0;
+            } else {
+                glDeleteProgram(lp);
+            }
+        }
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+    }
+
     m4_identity(g_r.view);
     m4_identity(g_r.proj);
     g_r.point_count = 0;
@@ -299,6 +350,8 @@ SDGE_API int sdgr_init(void) {
 
 SDGE_API void sdgr_shutdown(void) {
     if (!g_r_inited) return;
+    if (g_r.lines.prog) glDeleteProgram(g_r.lines.prog);
+    if (g_r.lines.vbo) glDeleteBuffers(1, &g_r.lines.vbo);
     glDeleteProgram(g_r.prog);
     memset(&g_r, 0, sizeof(g_r));
     g_r_inited = 0;
@@ -618,6 +671,96 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *mesh, const sdg_mat4 model,
     r_draw_mesh(mesh, model, joints, joint_count, mat, tex);
 }
 
+/* ------------------------------------------------------------------ lines */
+
+static void r_draw_lines(const float *vertices, int vertex_count,
+                         const float color[4], int always) {
+    if (!g_r_inited || !g_r.lines.prog || !vertices || vertex_count < 2)
+        return;
+
+    glUseProgram(g_r.lines.prog);
+    glUniformMatrix4fv(g_r.lines.loc_proj, 1, GL_FALSE, g_r.proj);
+    glUniformMatrix4fv(g_r.lines.loc_view, 1, GL_FALSE, g_r.view);
+    float c[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    if (color) memcpy(c, color, sizeof(c));
+    glUniform4fv(g_r.lines.loc_color, 1, c);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_r.lines.vbo);
+    size_t bytes = (size_t)vertex_count * 3u * sizeof(float);
+    if ((int)g_r.lines.vbo_cap < (int)bytes) {
+        glBufferData(GL_ARRAY_BUFFER, bytes, NULL, GL_DYNAMIC_DRAW);
+        g_r.lines.vbo_cap = (int)bytes;
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, vertices);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+
+    if (always) {
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+    } else {
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+    }
+    glDisable(GL_CULL_FACE);
+    glDrawArrays(GL_LINES, 0, vertex_count);
+    glEnable(GL_CULL_FACE);
+    glDisableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+}
+
+SDGE_API void sdgr_draw_lines(const float *vertices, int vertex_count,
+                              const float color[4]) {
+    r_draw_lines(vertices, vertex_count, color, 0);
+}
+
+SDGE_API void sdgr_draw_lines_always(const float *vertices, int vertex_count,
+                                     const float color[4]) {
+    r_draw_lines(vertices, vertex_count, color, 1);
+}
+
+SDGE_API void sdgr_draw_box_wire(const float center[3], const float half[3],
+                                 const sdg_mat4 *rotation,
+                                 const float color[4]) {
+    if (!center || !half) return;
+    /* the 8 corners of the box */
+    float corner[8][3];
+    for (int i = 0; i < 8; ++i) {
+        float sx = (i & 1) ? 1.0f : -1.0f;
+        float sy = (i & 2) ? 1.0f : -1.0f;
+        float sz = (i & 4) ? 1.0f : -1.0f;
+        float p[3] = { sx * half[0], sy * half[1], sz * half[2] };
+        if (rotation) {
+            float w[3];
+            m4_mul_vec3_dir(w, *rotation, p);
+            p[0] = w[0]; p[1] = w[1]; p[2] = w[2];
+        }
+        corner[i][0] = center[0] + p[0];
+        corner[i][1] = center[1] + p[1];
+        corner[i][2] = center[2] + p[2];
+    }
+    /* the 12 edges */
+    static const int edges[12][2] = {
+        { 0, 1 }, { 2, 3 }, { 4, 5 }, { 6, 7 },
+        { 0, 2 }, { 1, 3 }, { 4, 6 }, { 5, 7 },
+        { 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }
+    };
+    float verts[12 * 2 * 3];
+    int o = 0;
+    for (int e = 0; e < 12; ++e) {
+        for (int k = 0; k < 2; ++k) {
+            const float *p = corner[edges[e][k]];
+            verts[o++] = p[0];
+            verts[o++] = p[1];
+            verts[o++] = p[2];
+        }
+    }
+    r_draw_lines(verts, 24, color, 0);
+}
+
 SDGE_API int sdgr_screenshot(const char *path) {
     if (!g_r_inited || !path) return -1;
     int vp[4] = {0, 0, 0, 0};
@@ -677,6 +820,16 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *m, const sdg_mat4 mo,
                                 const float *j, int jc, const sdgr_material *mat,
                                 const sdgr_texture_set *tex) {
     (void)m; (void)mo; (void)j; (void)jc; (void)mat; (void)tex;
+}
+SDGE_API void sdgr_draw_lines(const float *v, int vc, const float c[4]) {
+    (void)v; (void)vc; (void)c;
+}
+SDGE_API void sdgr_draw_lines_always(const float *v, int vc, const float c[4]) {
+    (void)v; (void)vc; (void)c;
+}
+SDGE_API void sdgr_draw_box_wire(const float c[3], const float h[3],
+                                 const sdg_mat4 *r, const float col[4]) {
+    (void)c; (void)h; (void)r; (void)col;
 }
 SDGE_API int sdgr_screenshot(const char *p) { (void)p; return -1; }
 

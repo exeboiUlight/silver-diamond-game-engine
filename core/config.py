@@ -30,4 +30,6 @@ config = [
     "physics/physics2d.c",
     "physics/physics3d.c",
     "scene/scene.c",
+    "editor/editor.c",
+    "editor/gltf_save.c",
 ]

@@ -72,4 +72,6 @@
 
 #include "scene/scene.h"
 
+#include "editor/editor.h"
+
 #endif /* SDGE_H */

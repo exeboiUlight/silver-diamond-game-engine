@@ -146,6 +146,23 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *mesh, const sdg_mat4 model,
                                 const sdgr_material *mat,
                                 const sdgr_texture_set *tex);
 
+/* ------------------------------------------------------------------ lines
+ * A simple line batch for the debug helpers and the scene editor gizmos.
+ * `vertices` is a list of xyz triples, every two of them form one line:
+ *     float seg[] = { x0,y0,z0, x1,y1,z1, ... };
+ *     sdgr_draw_lines(seg, 6, color);
+ * The lines are drawn with the depth test on, so they can be hidden by the
+ * model; use sdgr_draw_lines_always() for the helpers that must be seen
+ * through the geometry. */
+SDGE_API void sdgr_draw_lines(const float *vertices, int vertex_count,
+                              const float color[4]);
+SDGE_API void sdgr_draw_lines_always(const float *vertices, int vertex_count,
+                                     const float color[4]);
+/* the 12 edges of a box (center + half extents, optionally rotated) */
+SDGE_API void sdgr_draw_box_wire(const float center[3], const float half[3],
+                                 const sdg_mat4 *rotation,
+                                 const float color[4]);
+
 SDGE_API int  sdgr_screenshot(const char *path);
 
 #ifdef __cplusplus

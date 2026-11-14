@@ -24,6 +24,9 @@ struct sdge_model {
     sdgr_material *materials;
     sdgr_texture_set *texsets;
 
+    /* the per node texture overrides (the scene editor): [node][slot] */
+    unsigned **node_tex;
+
     sdge_anim_player **players;
     int player_count;
     sdge_anim_player *active;
@@ -161,6 +164,50 @@ static void m_fill_slot(const sdge_gltf_model *g, const sdge_gltf_texinfo *ti,
     out->uv_scale[slot][0] = ti->scale_uv[0];
     out->uv_scale[slot][1] = ti->scale_uv[1];
 }
+
+/* rebuilds the world matrices of every node and the joint palettes */
+static void m_rebuild_world(sdge_model *m) {
+    const sdge_gltf_model *g = m->gltf;
+    if (g->node_count <= 0 || !m->static_world) return;
+
+    sdg_mat4 *locals = (sdg_mat4 *)malloc(sizeof(sdg_mat4)
+                                          * (size_t)g->node_count);
+    if (!locals) return;
+    for (int i = 0; i < g->node_count; ++i) {
+        if (g->nodes[i].has_matrix)
+            m4_copy(locals[i], g->nodes[i].matrix);
+        else
+            m4_from_trs(locals[i], g->nodes[i].translation,
+                        g->nodes[i].rotation, g->nodes[i].scale);
+    }
+    m_world_from_locals(g, locals, m->static_world);
+    free(locals);
+
+    /* the joint palettes of the skins */
+    for (int s = 0; s < g->skin_count; ++s) {
+        if (!m->static_palette || !m->static_palette[s]) continue;
+        int jc = g->skins[s].joint_count;
+        for (int j = 0; j < jc; ++j) {
+            int node = g->skins[s].joints[j];
+            sdg_mat4 world, pal_m;
+            if (node >= 0 && node < g->node_count)
+                m4_copy(world, m->static_world[node]);
+            else
+                m4_identity(world);
+            if (g->skins[s].inverse_bind) {
+                sdg_mat4 ibm;
+                memcpy(ibm, g->skins[s].inverse_bind + (size_t)j * 16,
+                       sizeof(ibm));
+                m4_mul(pal_m, world, ibm);
+            } else {
+                m4_copy(pal_m, world);
+            }
+            memcpy(m->static_palette[s] + (size_t)j * 16, pal_m, sizeof(pal_m));
+        }
+    }
+}
+
+/* ------------------------------------------------------------ the model */
 
 SDGE_API sdge_model *sdge_model_load(const char *path) {
     if (!path) return NULL;
@@ -351,6 +398,15 @@ SDGE_API void sdge_model_destroy(sdge_model *m) {
     }
     free(m->materials);
     free(m->texsets);
+    if (m->node_tex) {
+        for (int i = 0; i < m->gltf->node_count; ++i) {
+            if (!m->node_tex[i]) continue;
+            for (int s = 0; s < SDGR_TEX_SLOTS; ++s)
+                if (m->node_tex[i][s]) sdgr_free_texture(m->node_tex[i][s]);
+            free(m->node_tex[i]);
+        }
+        free(m->node_tex);
+    }
     if (m->players) {
         for (int i = 0; i < m->player_count; ++i)
             sdge_anim_player_destroy(m->players[i]);
@@ -402,6 +458,163 @@ SDGE_API void sdge_model_advance(sdge_model *m, float dt) {
 
 SDGE_API void sdge_model_set_time(sdge_model *m, float seconds) {
     if (m && m->active) sdge_anim_player_set_time(m->active, seconds);
+}
+
+/* ---------------------------------------------------------- the hierarchy */
+
+SDGE_API int sdge_model_node_count(const sdge_model *m) {
+    return (m && m->gltf) ? m->gltf->node_count : 0;
+}
+
+SDGE_API const char *sdge_model_node_name(const sdge_model *m, int node) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return "";
+    return m->gltf->nodes[node].name ? m->gltf->nodes[node].name : "";
+}
+
+SDGE_API int sdge_model_node_parent(const sdge_model *m, int node) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return -1;
+    return m->gltf->nodes[node].parent;
+}
+
+SDGE_API int sdge_model_node_mesh(const sdge_model *m, int node) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return -1;
+    return m->gltf->nodes[node].mesh;
+}
+
+SDGE_API int sdge_model_node_skin(const sdge_model *m, int node) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return -1;
+    return m->gltf->nodes[node].skin;
+}
+
+SDGE_API int sdge_model_node_children(const sdge_model *m, int node,
+                                      int *out, int max) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return 0;
+    const sdge_gltf_node *n = &m->gltf->nodes[node];
+    int count = 0;
+    for (int i = 0; i < n->child_count && count < max; ++i) {
+        if (out) out[count] = n->children[i];
+        ++count;
+    }
+    return count;
+}
+
+SDGE_API void sdge_model_node_get_transform(const sdge_model *m, int node,
+                                            float *t, float *r, float *s) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return;
+    const sdge_gltf_node *n = &m->gltf->nodes[node];
+    if (t) memcpy(t, n->translation, sizeof(float) * 3u);
+    if (r) memcpy(r, n->rotation, sizeof(float) * 4u);
+    if (s) memcpy(s, n->scale, sizeof(float) * 3u);
+}
+
+SDGE_API void sdge_model_node_set_transform(sdge_model *m, int node,
+                                            const sdg_vec3 t,
+                                            const sdg_quat r,
+                                            const sdg_vec3 s) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return;
+    sdge_gltf_node *n = &m->gltf->nodes[node];
+    if (t) v3_copy(n->translation, t);
+    if (r) { q_norm(n->rotation, r); }
+    if (s) v3_copy(n->scale, s);
+    /* the TRS is the source of truth from now on */
+    n->has_matrix = 0;
+    m4_from_trs(n->matrix, n->translation, n->rotation, n->scale);
+}
+
+SDGE_API void sdge_model_node_world(const sdge_model *m, int node,
+                                    sdg_mat4 out) {
+    if (!out) return;
+    m4_identity(out);
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return;
+    if (m->static_world) m4_copy(out, m->static_world[node]);
+    else m4_copy(out, m->gltf->nodes[node].matrix);
+}
+
+SDGE_API void sdge_model_node_bounds(const sdge_model *m, int node,
+                                     float min_out[3], float max_out[3]) {
+    if (min_out) v3_set(min_out, 1e30f, 1e30f, 1e30f);
+    if (max_out) v3_set(max_out, -1e30f, -1e30f, -1e30f);
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return;
+    const sdge_gltf_node *n = &m->gltf->nodes[node];
+    if (n->mesh < 0 || n->mesh >= m->gltf->mesh_count) return;
+
+    sdg_mat4 world;
+    sdge_model_node_world(m, node, world);
+
+    const sdge_gltf_mesh *mesh = &m->gltf->meshes[n->mesh];
+    int found = 0;
+    for (int p = 0; p < mesh->prim_count; ++p) {
+        const sdge_accessor *pa = &mesh->prims[p].positions;
+        if (pa->count <= 0) continue;
+        for (int c = 0; c < 8; ++c) {
+            sdg_vec3 corner, out;
+            corner[0] = (c & 1) ? pa->bounds_max[0] : pa->bounds_min[0];
+            corner[1] = (c & 2) ? pa->bounds_max[1] : pa->bounds_min[1];
+            corner[2] = (c & 4) ? pa->bounds_max[2] : pa->bounds_min[2];
+            m4_mul_point(out, world, corner);
+            for (int k = 0; k < 3; ++k) {
+                if (out[k] < min_out[k]) min_out[k] = out[k];
+                if (out[k] > max_out[k]) max_out[k] = out[k];
+            }
+            found = 1;
+        }
+    }
+    if (!found) {
+        if (min_out) v3_set(min_out, 0, 0, 0);
+        if (max_out) v3_set(max_out, 0, 0, 0);
+    }
+}
+
+SDGE_API void sdge_model_refresh(sdge_model *m) {
+    if (!m) return;
+    m_rebuild_world(m);
+}
+
+/* -------------------------------------------------------------- material */
+
+SDGE_API int sdge_model_node_prim_count(const sdge_model *m, int node) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return 0;
+    int mesh = m->gltf->nodes[node].mesh;
+    if (mesh < 0 || mesh >= m->gltf->mesh_count) return 0;
+    return m->gltf->meshes[mesh].prim_count;
+}
+
+SDGE_API int sdge_model_node_material(const sdge_model *m, int node, int prim) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return -1;
+    int mesh = m->gltf->nodes[node].mesh;
+    if (mesh < 0 || mesh >= m->gltf->mesh_count) return -1;
+    const sdge_gltf_mesh *gm = &m->gltf->meshes[mesh];
+    if (prim < 0 || prim >= gm->prim_count) return -1;
+    return gm->prims[prim].material;
+}
+
+SDGE_API int sdge_model_set_node_texture(sdge_model *m, int node, int slot,
+                                          unsigned texture) {
+    if (!m || !m->gltf || node < 0 || node >= m->gltf->node_count) return -1;
+    if (slot < 0 || slot >= SDGR_TEX_SLOTS) return -1;
+    if (!m->node_tex) {
+        m->node_tex = (unsigned **)calloc((size_t)m->gltf->node_count,
+                                           sizeof(unsigned *));
+        if (!m->node_tex) return -1;
+    }
+    if (!m->node_tex[node]) {
+        m->node_tex[node] = (unsigned *)calloc((size_t)SDGR_TEX_SLOTS,
+                                                sizeof(unsigned));
+        if (!m->node_tex[node]) return -1;
+    }
+    unsigned old = m->node_tex[node][slot];
+    m->node_tex[node][slot] = texture;
+    if (old && old != texture) sdgr_free_texture(old);
+    return 0;
+}
+
+SDGE_API unsigned sdge_model_get_node_texture(const sdge_model *m, int node,
+                                               int slot) {
+    if (!m || !m->node_tex || node < 0 || node >= m->gltf->node_count)
+        return 0;
+    if (slot < 0 || slot >= SDGR_TEX_SLOTS) return 0;
+    if (!m->node_tex[node]) return 0;
+    return m->node_tex[node][slot];
 }
 
 /* one drawable primitive collected for the current frame */
@@ -479,10 +692,38 @@ SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model) {
             int mat_index = mesh->prims[p].material;
             const sdgr_material *mat = NULL;
             const sdgr_texture_set *tex = NULL;
+            sdgr_texture_set tex_local;
             if (mat_index >= 0 && mat_index < g->material_count
                 && m->materials) {
                 mat = &m->materials[mat_index];
                 tex = &m->texsets[mat_index];
+            }
+            /* the texture overrides of the node (the scene editor) */
+            if (m->node_tex && m->node_tex[i]) {
+                int changed = 0;
+                for (int s = 0; s < SDGR_TEX_SLOTS; ++s) {
+                    if (m->node_tex[i][s]) changed = 1;
+                }
+                if (changed) {                    if (tex) tex_local = *tex;
+                    else memset(&tex_local, 0, sizeof(tex_local));
+                    for (int s = 0; s < SDGR_TEX_SLOTS; ++s) {
+                        if (!m->node_tex[i][s]) continue;
+                        switch (s) {
+                        case SDGR_SLOT_BASE: tex_local.base_color =
+                                m->node_tex[i][s]; break;
+                        case SDGR_SLOT_MR: tex_local.metallic_roughness =
+                                m->node_tex[i][s]; break;
+                        case SDGR_SLOT_NORMAL: tex_local.normal =
+                                m->node_tex[i][s]; break;
+                        case SDGR_SLOT_OCCLUSION: tex_local.occlusion =
+                                m->node_tex[i][s]; break;
+                        case SDGR_SLOT_EMISSIVE: tex_local.emissive =
+                                m->node_tex[i][s]; break;
+                        default: break;
+                        }
+                    }
+                    tex = &tex_local;
+                }
             }
 
             if (count >= cap) {

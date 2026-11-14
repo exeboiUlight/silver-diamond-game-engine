@@ -128,6 +128,7 @@ class Main:
             "physics/physics2d.h",
             "physics/physics3d.h",
             "scene/scene.h",
+            "editor/editor.h",
         ]
 
     # ------------------------------------------------------------- toolchain
@@ -408,6 +409,99 @@ class Main:
         print(f"[build] built {out}")
         return True
 
+    def build_test(self):
+        """builds and runs the headless physics tests"""
+        if not self.cc:
+            print("[build] ERROR: no C compiler found")
+            return False
+        src = "tests/physics_test.c"
+        if not os.path.isfile(self.abspath(src)):
+            print(f"[build] ERROR: the test source is not found: {src}")
+            return False
+
+        # the physics does not need the graphics, so it is built alone
+        # (without the DLL import/export macros - the test is standalone)
+        static_flags = [f for f in self.compile_flags(third_party=False,
+                                                      engine=False)
+                        if not f.startswith("-DSDGE_USE_DLL")]
+        obj = self.obj_of(src)
+        os.makedirs(self.abspath(self.obj_dir), exist_ok=True)
+        cmd = [self.cc, *static_flags]
+        for d in self.include_dirs():
+            cmd += ["-I", d]
+        cmd += ["-c", src, "-o", obj]
+        print("[build] cc:", " ".join(shlex.quote(c) for c in cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", cwd=ROOT)
+        if r.returncode != 0:
+            print(r.stdout)
+            print(r.stderr)
+            print(f"[build] FAILED to compile: {src}")
+            return False
+        if r.stderr.strip():
+            print(r.stderr.rstrip())
+
+        # the two physics modules are linked with the test
+        physics = ["core/physics/physics2d.c", "core/physics/physics3d.c"]
+        objs = [obj]
+        for p in physics:
+            pobj = self.obj_of(p)
+            if self.is_stale(p, pobj):
+                cmd = [self.cc, *static_flags]
+                for d in self.include_dirs():
+                    cmd += ["-I", d]
+                cmd += ["-c", p, "-o", pobj]
+                print("[build] cc:", " ".join(shlex.quote(c) for c in cmd))
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", cwd=ROOT)
+                if r.returncode != 0:
+                    print(r.stdout)
+                    print(r.stderr)
+                    print(f"[build] FAILED to compile: {p}")
+                    return False
+            objs.append(pobj)
+
+        out = os.path.join(self.build_dir,
+                           "physics_test" + (".exe" if self.is_windows else ""))
+        cmd = [self.cc, *objs, "-o", out, "-lm"]
+        print("[build] ld:", " ".join(shlex.quote(c) for c in cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", cwd=ROOT)
+        if r.returncode != 0:
+            print(r.stdout)
+            print(r.stderr)
+            print(f"[build] FAILED to link {out}")
+            return False
+
+        print(f"[build] built {out}\n")
+        r = subprocess.run([os.path.abspath(out)], cwd=ROOT)
+        return r.returncode == 0
+
+    def build_editor(self):
+        """builds src/editor.c into the scene editor executable"""
+        if not self.cc:
+            print("[build] ERROR: no C compiler found")
+            return False
+        src = "src/editor.c"
+        if not os.path.isfile(self.abspath(src)):
+            print(f"[build] ERROR: editor source not found: {src}")
+            return False
+
+        if not self.build(build_app=False):
+            return False
+
+        obj = self.obj_of(src)
+        os.makedirs(self.abspath(self.obj_dir), exist_ok=True)
+        if self.is_stale(src, obj):
+            if not self.compile(src, third_party=False, engine=False):
+                return False
+        out = os.path.join(self.build_dir,
+                           "sdge_editor" + (".exe" if self.is_windows else ""))
+        if not self.link_app([obj], out):
+            return False
+        print(f"[build] built {out}")
+        return True
+
     def copy_api_to_release(self):
         source = self.abspath("API")
         target = self.abspath(os.path.join(self.build_dir, "API"))
@@ -523,7 +617,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Silver Diamond Game Engine build script")
     ap.add_argument("command", nargs="?", default="build",
-                    choices=["build", "run", "rebuild", "clean", "sdk", "demo"],
+                    choices=["build", "run", "rebuild", "clean", "sdk", "demo",
+                             "editor", "test"],
                     help="what to do (default: build)")
     ap.add_argument("--debug", action="store_true",
                     help="-O0 -g build (default: -O2 -DNDEBUG)")
@@ -554,6 +649,10 @@ def main():
     if args.command == "demo":
         name = args.demo or "texture_demo"
         return 0 if m.build_demo(name) else 1
+    if args.command == "editor":
+        return 0 if m.build_editor() else 1
+    if args.command == "test":
+        return 0 if m.build_test() else 1
     return 1
 
 

@@ -1,4 +1,20 @@
-/* physics3d.c - Silver Diamond Game Engine :: 3D rigid body physics */
+/* physics3d.c - Silver Diamond Game Engine :: 3D rigid body physics
+ *
+ * The orientation of a body is a quaternion.  Everything that needs the
+ * axes of a box (the SAT test, the support points, the inertia tensor)
+ * works with the row major 3x3 matrix built from it:
+ *
+ *      m[row * 3 + col] = R(row, col)
+ *
+ * The world direction of the local axis i is the COLUMN i of R:
+ *      axis_i = (m[0*3+i], m[1*3+i], m[2*3+i])
+ * and the local coordinates of a world vector are R^T * v:
+ *      local_i = dot(axis_i, v)
+ *
+ * Getting this backwards (using the rows as if they were the columns) makes
+ * every box collide as if it was mirrored around the diagonal - that is
+ * what used to make the bodies spin for no reason.
+ */
 #include "physics3d.h"
 
 #include <stdlib.h>
@@ -32,44 +48,141 @@ static void v3_norm(float a[3]) {
     if (l > 1e-8f) { a[0] /= l; a[1] /= l; a[2] /= l; }
 }
 
-/* a stable tangent for a normal: any unit vector perpendicular to it */
-static void v3_tangent(const float n[3], float t[3]) {
+/* two stable tangents for a normal: any orthonormal pair perpendicular to it */
+static void v3_tangents(const float n[3], float t1[3], float t2[3]) {
     float helper[3] = { 1.0f, 0.0f, 0.0f };
     if (fabsf(n[0]) > fabsf(n[1]) && fabsf(n[0]) > fabsf(n[2])) {
         helper[0] = 0.0f; helper[1] = 1.0f;
     }
-    v3_cross(n, helper, t);
-    v3_norm(t);
+    v3_cross(n, helper, t1);
+    v3_norm(t1);
+    v3_cross(n, t1, t2);
+    v3_norm(t2);
 }
 
-/* the orientation matrix of a body from its euler angles */
-static void body_basis(const sdph3_body *b, float m[9]) {
-    float cx = cosf(b->angle[0]), sx = sinf(b->angle[0]);
-    float cy = cosf(b->angle[1]), sy = sinf(b->angle[1]);
-    float cz = cosf(b->angle[2]), sz = sinf(b->angle[2]);
-    /* Rz * Ry * Rx */
-    m[0] = cz * cy;  m[1] = cz * sy * sx - sz * cx;  m[2] = cz * sy * cx + sz * sx;
-    m[3] = sz * cy;  m[4] = sz * sy * sx + cz * cx;  m[5] = sz * sy * cx - cz * sx;
-    m[6] = -sy;      m[7] = cy * sx;                 m[8] = cy * cx;
+/* ----------------------------------------------------------- quaternions */
+
+/* the quaternion -> the row major rotation matrix */
+static void quat_to_basis(const float q[4], float m[9]) {
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y, xz = x * z, yz = y * z;
+    float wx = w * x, wy = w * y, wz = w * z;
+    m[0] = 1.0f - 2.0f * (yy + zz);
+    m[1] = 2.0f * (xy - wz);
+    m[2] = 2.0f * (xz + wy);
+    m[3] = 2.0f * (xy + wz);
+    m[4] = 1.0f - 2.0f * (xx + zz);
+    m[5] = 2.0f * (yz - wx);
+    m[6] = 2.0f * (xz - wy);
+    m[7] = 2.0f * (yz + wx);
+    m[8] = 1.0f - 2.0f * (xx + yy);
 }
 
-/* the world space direction of a local axis */
+/* the euler angles (Rz*Ry*Rx) -> quaternion */
+static void quat_from_euler(float q[4], float ax, float ay, float az) {
+    float hx = 0.5f * ax, hy = 0.5f * ay, hz = 0.5f * az;
+    float sx = sinf(hx), cx = cosf(hx);
+    float sy = sinf(hy), cy = cosf(hy);
+    float sz = sinf(hz), cz = cosf(hz);
+    q[0] = cz * cy * sx - sz * sy * cx;
+    q[1] = cz * sy * cx + sz * cy * sx;
+    q[2] = sz * cy * cx - cz * sy * sx;
+    q[3] = cz * cy * cx + sz * sy * sx;
+}
+
+/* the quaternion -> the euler angles (the same Rz*Ry*Rx convention) */
+static void euler_from_quat(float out[3], const float q[4]) {
+    float m[9];
+    quat_to_basis(q, m);
+    float sy = -m[6];                 /* m[2*3+0] = -sin(ay) */
+    if (sy > 1.0f) sy = 1.0f;
+    if (sy < -1.0f) sy = -1.0f;
+    float ay = asinf(sy);
+    float ax, az;
+    if (fabsf(sy) > 0.99999f) {
+        /* the gimbal lock: the X and Z rotations are merged */
+        ax = atan2f(-m[1], m[4]);
+        az = 0.0f;
+    } else {
+        ax = atan2f(m[7], m[8]);
+        az = atan2f(m[3], m[0]);
+    }
+    out[0] = ax; out[1] = ay; out[2] = az;
+}
+
+static void quat_norm(float q[4]) {
+    float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (l > 1e-8f) {
+        float inv = 1.0f / l;
+        q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv;
+    } else {
+        q[0] = 0.0f; q[1] = 0.0f; q[2] = 0.0f; q[3] = 1.0f;
+    }
+}
+
+/* integrates the orientation with the world space angular velocity:
+ *   q' = q + 0.5 * dt * (omega (x) q)
+ * The naive "angle += angvel * dt" is wrong as soon as two axes rotate at
+ * the same time - the body then spins around a fake axis. */
+static void quat_integrate(float q[4], const float w[3], float dt) {
+    float dx = 0.5f * dt * w[0];
+    float dy = 0.5f * dt * w[1];
+    float dz = 0.5f * dt * w[2];
+    float nx = dx * q[3] + dy * q[2] - dz * q[1];
+    float ny = -dx * q[2] + dy * q[3] + dz * q[0];
+    float nz = dx * q[1] - dy * q[0] + dz * q[3];
+    float nw = -dx * q[0] - dy * q[1] - dz * q[2];
+    q[0] += nx; q[1] += ny; q[2] += nz; q[3] += nw;
+    quat_norm(q);
+}
+
+/* ------------------------------------------------------------- the basis */
+
+/* the world direction of the local axis i = the column i of the matrix */
 static void basis_axis(const float m[9], int i, float out[3]) {
-    out[0] = m[i * 3];
-    out[1] = m[i * 3 + 1];
-    out[2] = m[i * 3 + 2];
+    out[0] = m[0 * 3 + i];
+    out[1] = m[1 * 3 + i];
+    out[2] = m[2 * 3 + i];
+}
+
+/* the local coordinates of a world vector: R^T * v */
+static void basis_to_local(const float m[9], const float v[3], float out[3]) {
+    for (int i = 0; i < 3; ++i)
+        out[i] = v[0] * m[0 * 3 + i] + v[1] * m[1 * 3 + i] + v[2] * m[2 * 3 + i];
+}
+
+/* the world vector of a local one: R * v */
+static void basis_to_world(const float m[9], const float v[3], float out[3]) {
+    for (int i = 0; i < 3; ++i)
+        out[i] = v[0] * m[i * 3 + 0] + v[1] * m[i * 3 + 1] + v[2] * m[i * 3 + 2];
+}
+
+/* the world space inverse inertia tensor: R * diag(inv) * R^T */
+static void body_inv_inertia_world(const sdph3_body *b, const float m[9],
+                                   float out[9]) {
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k)
+                s += m[i * 3 + k] * b->inv_inertia_axis[k] * m[j * 3 + k];
+            out[i * 3 + j] = s;
+        }
+    }
 }
 
 /* ------------------------------------------------------------- contacts */
 
 typedef struct {
     sdph3_body *a, *b;
+    const float *iia, *iib;   /* the world inverse inertia of a and b */
     float n[3];          /* the normal, from a to b */
     float p[3];          /* the contact point */
     float depth;
-    float normal_mass, tangent_mass;
+    float normal_mass;
+    float tangent_mass[2];
     float bias;
-    float normal_accum, tangent_accum;
+    float normal_accum, tangent_accum[2];
     float ra[3], rb[3];
     float restitution, friction;
     float vn_init;
@@ -86,9 +199,11 @@ static void cache_free(sdph3_world *w);
 sdph3_world *sdph3_world_create(void) {
     sdph3_world *w = (sdph3_world *)calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->gravity[2] = -9.81f;
-    w->damping = 0.02f;
-    w->ang_damping = 0.05f;
+    /* the engine is Y-up (the glTF convention), so the gravity pulls
+     * down along -Y and not along -Z */
+    w->gravity[1] = -9.81f;
+    w->damping = 0.05f;
+    w->ang_damping = 0.1f;
     w->iterations = 12;
     return w;
 }
@@ -96,7 +211,10 @@ sdph3_world *sdph3_world_create(void) {
 void sdph3_world_destroy(sdph3_world *w) {
     if (!w) return;
     cache_free(w);
-    free(w->bodies);
+    if (w->bodies) {
+        for (int i = 0; i < w->count; ++i) free(w->bodies[i]);
+        free(w->bodies);
+    }
     free(w);
 }
 
@@ -113,23 +231,72 @@ void sdph3_world_set_bounds(sdph3_world *w, int use, float minx, float miny,
     w->bounds[3] = maxx; w->bounds[4] = maxy; w->bounds[5] = maxz;
 }
 
+void sdph3_world_set_damping(sdph3_world *w, float linear, float angular) {
+    if (!w) return;
+    w->damping = linear;
+    w->ang_damping = angular;
+}
+
+void sdph3_world_set_iterations(sdph3_world *w, int iterations) {
+    if (!w) return;
+    w->iterations = iterations < 1 ? 1 : iterations;
+}
+
 /* ------------------------------------------------------------ the bodies */
 
+/* the bodies are allocated one by one: the array only holds the pointers,
+ * so adding a body never moves the others */
 static sdph3_body *body_add(sdph3_world *w) {
     if (!w) return NULL;
     if (w->count >= w->cap) {
         int cap = w->cap ? w->cap * 2 : 32;
-        sdph3_body *nb = (sdph3_body *)realloc(w->bodies,
-                                                sizeof(sdph3_body) * (size_t)cap);
+        sdph3_body **nb = (sdph3_body **)realloc(w->bodies,
+                                                 sizeof(sdph3_body *)
+                                                 * (size_t)cap);
         if (!nb) return NULL;
         w->bodies = nb;
         w->cap = cap;
     }
-    sdph3_body *b = &w->bodies[w->count++];
-    memset(b, 0, sizeof(*b));
+    sdph3_body *b = (sdph3_body *)calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    w->bodies[w->count++] = b;
     b->restitution = 0.2f;
     b->friction = 0.4f;
+    b->type = SDPH3_DYNAMIC;
+    b->quat[3] = 1.0f;
     return b;
+}
+
+/* recomputes the inertia of a body from its shape and mass */
+static void body_update_inertia(sdph3_body *b, float mass) {
+    if (mass <= 0.0f) {
+        b->inv_mass = 0.0f;
+        b->inv_inertia = 0.0f;
+        b->inv_inertia_axis[0] = 0.0f;
+        b->inv_inertia_axis[1] = 0.0f;
+        b->inv_inertia_axis[2] = 0.0f;
+        return;
+    }
+    b->inv_mass = 1.0f / mass;
+    if (b->shape == SDPH3_SPHERE) {
+        /* a solid sphere: I = 2/5 * m * r^2 */
+        float r = b->radius > 1e-6f ? b->radius : 1e-6f;
+        float i = 0.4f * mass * r * r;
+        float inv = (i > 0.0f) ? (1.0f / i) : 0.0f;
+        b->inv_inertia_axis[0] = inv;
+        b->inv_inertia_axis[1] = inv;
+        b->inv_inertia_axis[2] = inv;
+    } else {
+        /* a box: Ixx = m/3 * (hy^2 + hz^2) and so on */
+        float ix = mass * (b->half[1] * b->half[1] + b->half[2] * b->half[2]) / 3.0f;
+        float iy = mass * (b->half[0] * b->half[0] + b->half[2] * b->half[2]) / 3.0f;
+        float iz = mass * (b->half[0] * b->half[0] + b->half[1] * b->half[1]) / 3.0f;
+        b->inv_inertia_axis[0] = (ix > 0.0f) ? (1.0f / ix) : 0.0f;
+        b->inv_inertia_axis[1] = (iy > 0.0f) ? (1.0f / iy) : 0.0f;
+        b->inv_inertia_axis[2] = (iz > 0.0f) ? (1.0f / iz) : 0.0f;
+    }
+    b->inv_inertia = (b->inv_inertia_axis[0] + b->inv_inertia_axis[1] +
+                      b->inv_inertia_axis[2]) / 3.0f;
 }
 
 sdph3_body *sdph3_add_sphere(sdph3_world *w, float x, float y, float z,
@@ -140,10 +307,8 @@ sdph3_body *sdph3_add_sphere(sdph3_world *w, float x, float y, float z,
     b->pos[0] = x; b->pos[1] = y; b->pos[2] = z;
     b->radius = radius;
     b->bound = radius;
-    if (mass > 0.0f) {
-        b->inv_mass = 1.0f / mass;
-        b->inv_inertia = 0.4f * b->inv_mass / (radius * radius);
-    }
+    body_update_inertia(b, mass);
+    if (mass <= 0.0f) b->type = SDPH3_STATIC;
     return b;
 }
 
@@ -155,21 +320,20 @@ sdph3_body *sdph3_add_box(sdph3_world *w, float x, float y, float z,
     b->pos[0] = x; b->pos[1] = y; b->pos[2] = z;
     b->half[0] = hw; b->half[1] = hh; b->half[2] = hd;
     b->bound = sqrtf(hw * hw + hh * hh + hd * hd);
-    if (mass > 0.0f) {
-        b->inv_mass = 1.0f / mass;
-        float i = (float)mass * (hw * hw + hh * hh + hd * hd) / 3.0f;
-        b->inv_inertia = (i > 0.0f) ? (1.0f / i) : 0.0f;
-    }
+    body_update_inertia(b, mass);
+    if (mass <= 0.0f) b->type = SDPH3_STATIC;
     return b;
 }
 
 void sdph3_remove(sdph3_world *w, const sdph3_body *body) {
     if (!w || !body) return;
     for (int i = 0; i < w->count; ++i) {
-        if (&w->bodies[i] != body) continue;
+        if (w->bodies[i] != body) continue;
+        free(w->bodies[i]);
         for (int k = i; k < w->count - 1; ++k)
             w->bodies[k] = w->bodies[k + 1];
         w->count--;
+        w->bodies[w->count] = NULL;
         return;
     }
 }
@@ -181,19 +345,101 @@ void sdph3_set_velocity(sdph3_body *b, float vx, float vy, float vz) {
     b->sleep_timer = 0.0f;
 }
 
+void sdph3_set_angular_velocity(sdph3_body *b, float wx, float wy, float wz) {
+    if (!b) return;
+    b->angvel[0] = wx; b->angvel[1] = wy; b->angvel[2] = wz;
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+void sdph3_set_position(sdph3_body *b, float x, float y, float z) {
+    if (!b) return;
+    b->pos[0] = x; b->pos[1] = y; b->pos[2] = z;
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+void sdph3_set_angle(sdph3_body *b, float ax, float ay, float az) {
+    if (!b) return;
+    quat_from_euler(b->quat, ax, ay, az);
+    b->angle[0] = ax; b->angle[1] = ay; b->angle[2] = az;
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+void sdph3_set_quat(sdph3_body *b, const float q[4]) {
+    if (!b || !q) return;
+    b->quat[0] = q[0]; b->quat[1] = q[1]; b->quat[2] = q[2]; b->quat[3] = q[3];
+    quat_norm(b->quat);
+    euler_from_quat(b->angle, b->quat);
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+void sdph3_get_quat(const sdph3_body *b, float out[4]) {
+    if (!b || !out) return;
+    out[0] = b->quat[0]; out[1] = b->quat[1];
+    out[2] = b->quat[2]; out[3] = b->quat[3];
+}
+
+void sdph3_set_type(sdph3_body *b, int type) {
+    if (!b) return;
+    b->type = type;
+    if (type == SDPH3_STATIC) {
+        b->inv_mass = 0.0f;
+        b->inv_inertia = 0.0f;
+        b->inv_inertia_axis[0] = 0.0f;
+        b->inv_inertia_axis[1] = 0.0f;
+        b->inv_inertia_axis[2] = 0.0f;
+    }
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+int sdph3_get_type(const sdph3_body *b) {
+    return b ? b->type : SDPH3_STATIC;
+}
+
+void sdph3_set_restitution(sdph3_body *b, float restitution) {
+    if (b) b->restitution = restitution;
+}
+
+void sdph3_set_friction(sdph3_body *b, float friction) {
+    if (b) b->friction = friction;
+}
+
+void sdph3_wake(sdph3_body *b) {
+    if (!b) return;
+    b->sleeping = 0;
+    b->sleep_timer = 0.0f;
+}
+
+void sdph3_sleep(sdph3_body *b) {
+    if (!b) return;
+    b->sleeping = 1;
+    b->sleep_timer = 0.0f;
+    b->vel[0] = b->vel[1] = b->vel[2] = 0.0f;
+    b->angvel[0] = b->angvel[1] = b->angvel[2] = 0.0f;
+}
+
 void sdph3_apply_impulse(sdph3_body *b, float ix, float iy, float iz,
                          float rx, float ry, float rz) {
     if (!b || b->inv_mass <= 0.0f) return;
     b->vel[0] += ix * b->inv_mass;
     b->vel[1] += iy * b->inv_mass;
     b->vel[2] += iz * b->inv_mass;
-    float tx = ry * iz - rz * iy;
-    float ty = rz * ix - rx * iz;
-    float tz = rx * iy - ry * ix;
-    b->angvel[0] += tx * b->inv_inertia;
-    b->angvel[1] += ty * b->inv_inertia;
-    b->angvel[2] += tz * b->inv_inertia;
+    float t[3];
+    t[0] = ry * iz - rz * iy;
+    t[1] = rz * ix - rx * iz;
+    t[2] = rx * iy - ry * ix;
+    float m[9], ii[9];
+    quat_to_basis(b->quat, m);
+    body_inv_inertia_world(b, m, ii);
+    b->angvel[0] += ii[0] * t[0] + ii[1] * t[1] + ii[2] * t[2];
+    b->angvel[1] += ii[3] * t[0] + ii[4] * t[1] + ii[5] * t[2];
+    b->angvel[2] += ii[6] * t[0] + ii[7] * t[1] + ii[8] * t[2];
     b->sleeping = 0;
+    b->sleep_timer = 0.0f;
 }
 
 int sdph3_point_in_body(const sdph3_body *b, float x, float y, float z) {
@@ -201,14 +447,12 @@ int sdph3_point_in_body(const sdph3_body *b, float x, float y, float z) {
     float dx = x - b->pos[0], dy = y - b->pos[1], dz = z - b->pos[2];
     if (b->shape == SDPH3_SPHERE)
         return dx * dx + dy * dy + dz * dz <= b->radius * b->radius;
-    float m[9];
-    body_basis(b, m);
-    /* the local coordinates */
-    float lx = dx * m[0] + dy * m[1] + dz * m[2];
-    float ly = dx * m[3] + dy * m[4] + dz * m[5];
-    float lz = dx * m[6] + dy * m[7] + dz * m[8];
-    return fabsf(lx) <= b->half[0] && fabsf(ly) <= b->half[1] &&
-           fabsf(lz) <= b->half[2];
+    float m[9], l[3], d[3];
+    quat_to_basis(b->quat, m);
+    d[0] = dx; d[1] = dy; d[2] = dz;
+    basis_to_local(m, d, l);
+    return fabsf(l[0]) <= b->half[0] && fabsf(l[1]) <= b->half[1] &&
+           fabsf(l[2]) <= b->half[2];
 }
 
 int sdph3_query_sphere(sdph3_world *w, float x, float y, float z, float r,
@@ -216,7 +460,7 @@ int sdph3_query_sphere(sdph3_world *w, float x, float y, float z, float r,
     if (!w || !out) return 0;
     int n = 0;
     for (int i = 0; i < w->count && n < max; ++i) {
-        sdph3_body *b = &w->bodies[i];
+        sdph3_body *b = w->bodies[i];
         float dx = x - b->pos[0], dy = y - b->pos[1], dz = z - b->pos[2];
         float rr = r + b->bound;
         if (dx * dx + dy * dy + dz * dz <= rr * rr) out[n++] = b;
@@ -228,10 +472,11 @@ float sdph3_energy(const sdph3_world *w) {
     if (!w) return 0.0f;
     float e = 0.0f;
     for (int i = 0; i < w->count; ++i) {
-        const sdph3_body *b = &w->bodies[i];
+        const sdph3_body *b = w->bodies[i];
         if (b->inv_mass <= 0.0f) continue;
         e += 0.5f / b->inv_mass *
-             (b->vel[0] * b->vel[0] + b->vel[1] * b->vel[1] + b->vel[2] * b->vel[2]);
+             (b->vel[0] * b->vel[0] + b->vel[1] * b->vel[1] +
+              b->vel[2] * b->vel[2]);
     }
     return e;
 }
@@ -249,9 +494,11 @@ static void body_aabb(const sdph3_body *b, const float *basis, float *out) {
     }
     float ex = 0.0f, ey = 0.0f, ez = 0.0f;
     for (int i = 0; i < 3; ++i) {
-        ex += fabsf(basis[i * 3]) * b->half[i];
-        ey += fabsf(basis[i * 3 + 1]) * b->half[i];
-        ez += fabsf(basis[i * 3 + 2]) * b->half[i];
+        float ax[3];
+        basis_axis(basis, i, ax);
+        ex += fabsf(ax[0]) * b->half[i];
+        ey += fabsf(ax[1]) * b->half[i];
+        ez += fabsf(ax[2]) * b->half[i];
     }
     out[0] = b->pos[0] - ex; out[1] = b->pos[1] - ey; out[2] = b->pos[2] - ez;
     out[3] = b->pos[0] + ex; out[4] = b->pos[1] + ey; out[5] = b->pos[2] + ez;
@@ -262,8 +509,10 @@ static void body_aabb(const sdph3_body *b, const float *basis, float *out) {
 typedef struct {
     float *aabb;        /* 6 floats per body */
     float *basis;       /* 9 floats per body */
+    float *inertia;     /* 9 floats per body (the world tensor) */
     int   *order;       /* the body indices sorted by minx */
-    int    count;
+    int    count;       /* the number of live bodies */
+    int    cap;         /* the allocated capacity */
     contact3 *contacts;
     int    contact_cap;
 } ph3_cache;
@@ -278,6 +527,7 @@ static void cache_free(sdph3_world *w) {
     if (!c) return;
     free(c->aabb);
     free(c->basis);
+    free(c->inertia);
     free(c->order);
     free(c->contacts);
     free(c);
@@ -285,17 +535,20 @@ static void cache_free(sdph3_world *w) {
 }
 
 static int cache_reserve(ph3_cache *c, int count) {
-    if (c->count >= count) return 0;
+    if (c->cap >= count) return 0;
     float *na = (float *)realloc(c->aabb, sizeof(float) * 6u * (size_t)count);
     if (!na) return -1;
     c->aabb = na;
     float *nb = (float *)realloc(c->basis, sizeof(float) * 9u * (size_t)count);
     if (!nb) return -1;
     c->basis = nb;
+    float *ni = (float *)realloc(c->inertia, sizeof(float) * 9u * (size_t)count);
+    if (!ni) return -1;
+    c->inertia = ni;
     int *no = (int *)realloc(c->order, sizeof(int) * (size_t)count);
     if (!no) return -1;
     c->order = no;
-    c->count = count;
+    c->cap = count;
     return 0;
 }
 
@@ -346,14 +599,13 @@ static void box_closest(const sdph3_body *b, const float m[9],
                         const float wp[3], float out[3]) {
     float d[3] = { wp[0] - b->pos[0], wp[1] - b->pos[1], wp[2] - b->pos[2] };
     float l[3];
-    for (int i = 0; i < 3; ++i)
-        l[i] = d[0] * m[i * 3] + d[1] * m[i * 3 + 1] + d[2] * m[i * 3 + 2];
+    basis_to_local(m, d, l);
     for (int i = 0; i < 3; ++i) {
         if (l[i] > b->half[i]) l[i] = b->half[i];
         if (l[i] < -b->half[i]) l[i] = -b->half[i];
     }
-    for (int i = 0; i < 3; ++i)
-        out[i] = b->pos[i] + l[0] * m[i * 3] + l[1] * m[i * 3 + 1] + l[2] * m[i * 3 + 2];
+    basis_to_world(m, l, out);
+    for (int i = 0; i < 3; ++i) out[i] += b->pos[i];
 }
 
 static int collide_sphere_box(sdph3_body *sphere, sdph3_body *box,
@@ -420,7 +672,14 @@ static int clip_poly(const float in[][3], int count, const float normal[3],
 /* the face contact manifold: the incident face of one box is clipped against
  * the four side planes of the reference face.  The resulting points lie
  * inside the actual overlap area, so the lever arms stay physically correct
- * (a large floor no longer puts the contact point at its centre). */
+ * (a large floor no longer puts the contact point at its centre).
+ *
+ * Every clipped vertex becomes its own contact point (up to four).  A single
+ * point cannot hold a box: it is free to rotate around that point, and the
+ * solver then fights itself (the normal impulse rotates the box, the
+ * friction reacts, the next normal impulse undoes it - the box ends up
+ * spinning and shooting away).  Four points describe the real overlap and
+ * keep the box flat. */
 static int box_manifold(const sdph3_body *a, const sdph3_body *b,
                         const float *ma, const float *mb,
                         const float n[3], int ref_is_b, int axis,
@@ -490,32 +749,21 @@ static int box_manifold(const sdph3_body *a, const sdph3_body *b,
         }
     }
 
-    /* a single contact at the centre of the clipped overlap: a point at the
-     * centre of a flat face applies no tipping torque, while a corner/edge
-     * contact still lands on the actual corner (several independent contact
-     * points make the sequential solver spin small boxes up) */
-    float sum[3] = { 0.0f, 0.0f, 0.0f };
-    float max_depth = 0.0f;
-    int nc = 0;
-    for (int i = 0; i < np; ++i) {
+    /* one contact per penetrating vertex of the clipped polygon */
+    int count = 0;
+    float base = v3_dot(ref->pos, fn) + half_ref;
+    for (int i = 0; i < np && count < 4; ++i) {
         const float *v = src + (size_t)i * 3u;
-        float sep = v3_dot(v, fn) - v3_dot(ref->pos, fn) - half_ref;
+        float sep = v3_dot(v, fn) - base;
         if (sep > 0.0f) continue;
-        sum[0] += v[0]; sum[1] += v[1]; sum[2] += v[2];
-        if (-sep > max_depth) max_depth = -sep;
-        ++nc;
-    }
-    if (nc > 0) {
-        contact3 *c = &out[0];
+        contact3 *c = &out[count++];
         c->a = (sdph3_body *)a;
         c->b = (sdph3_body *)b;
         c->n[0] = n[0]; c->n[1] = n[1]; c->n[2] = n[2];
-        c->depth = max_depth;
-        c->p[0] = sum[0] / (float)nc;
-        c->p[1] = sum[1] / (float)nc;
-        c->p[2] = sum[2] / (float)nc;
-        return 1;
+        c->depth = -sep;
+        c->p[0] = v[0]; c->p[1] = v[1]; c->p[2] = v[2];
     }
+    if (count > 0) return count;
 
     /* the numerical fallback: a single point between the support points */
     float sa[3], sb[3], neg[3] = { -n[0], -n[1], -n[2] };
@@ -581,7 +829,8 @@ static int collide_box(sdph3_body *a, sdph3_body *b,
     for (int s = 0; s < 2; ++s) {
         const float *m = s ? mb : ma;
         for (int i = 0; i < 3; ++i) {
-            float ax[3] = { m[i * 3], m[i * 3 + 1], m[i * 3 + 2] };
+            float ax[3];
+            basis_axis(m, i, ax);
             float ra = 0.0f, rb = 0.0f;
             for (int k = 0; k < 3; ++k) {
                 float aa[3], bb[3];
@@ -676,28 +925,41 @@ static int collide3(sdph3_body *a, sdph3_body *b,
 
 /* -------------------------------------------------------- the solver */
 
-static void prepare_contact3(contact3 *c, float dt) {
+/* the effective mass of a body along a direction at the offset r:
+ *   k = 1/m + (r x d)^T * I^-1 * (r x d)
+ * The rotational part is what keeps a lever arm from being ignored: without
+ * it the solver believes that a push at the corner of a box costs nothing,
+ * the impulses grow without a limit and the box is launched. */
+static float eff_mass(const sdph3_body *b, const float r[3], const float d[3],
+                      const float ii[9]) {
+    float rd[3], t[3];
+    v3_cross(r, d, rd);
+    t[0] = ii[0] * rd[0] + ii[1] * rd[1] + ii[2] * rd[2];
+    t[1] = ii[3] * rd[0] + ii[4] * rd[1] + ii[5] * rd[2];
+    t[2] = ii[6] * rd[0] + ii[7] * rd[1] + ii[8] * rd[2];
+    return b->inv_mass + v3_dot(rd, t);
+}
+
+static void prepare_contact3(contact3 *c, float dt,
+                             const float iia[9], const float iib[9]) {
     sdph3_body *a = c->a, *b = c->b;
+    c->iia = iia;
+    c->iib = iib;
     for (int i = 0; i < 3; ++i) {
         c->ra[i] = c->p[i] - a->pos[i];
         c->rb[i] = c->p[i] - b->pos[i];
     }
-    float cross_a[3], cross_b[3];
-    v3_cross(c->ra, c->n, cross_a);
-    v3_cross(c->rb, c->n, cross_b);
-    float kn = a->inv_mass + b->inv_mass +
-               a->inv_inertia * v3_dot(cross_a, cross_a) +
-               b->inv_inertia * v3_dot(cross_b, cross_b);
-    c->normal_mass = (kn > 0.0f) ? (1.0f / kn) : 0.0f;
+    c->normal_mass = eff_mass(a, c->ra, c->n, iia) +
+                     eff_mass(b, c->rb, c->n, iib);
+    if (c->normal_mass > 0.0f) c->normal_mass = 1.0f / c->normal_mass;
+    else c->normal_mass = 0.0f;
 
-    float t[3];
-    v3_tangent(c->n, t);
-    float ta[3], tb[3];
-    v3_cross(c->ra, t, ta);
-    v3_cross(c->rb, t, tb);
-    float kt = a->inv_mass + b->inv_mass +
-               a->inv_inertia * v3_dot(ta, ta) + b->inv_inertia * v3_dot(tb, tb);
-    c->tangent_mass = (kt > 0.0f) ? (1.0f / kt) : 0.0f;
+    float t1[3], t2[3];
+    v3_tangents(c->n, t1, t2);
+    float m1 = eff_mass(a, c->ra, t1, iia) + eff_mass(b, c->rb, t1, iib);
+    float m2 = eff_mass(a, c->ra, t2, iia) + eff_mass(b, c->rb, t2, iib);
+    c->tangent_mass[0] = (m1 > 0.0f) ? (1.0f / m1) : 0.0f;
+    c->tangent_mass[1] = (m2 > 0.0f) ? (1.0f / m2) : 0.0f;
 
     c->restitution = (a->restitution < b->restitution) ? a->restitution
                                                         : b->restitution;
@@ -714,7 +976,8 @@ static void prepare_contact3(contact3 *c, float dt) {
     if (bias < 0.0f) bias = 0.0f;
     c->bias = -bias;
     c->normal_accum = 0.0f;
-    c->tangent_accum = 0.0f;
+    c->tangent_accum[0] = 0.0f;
+    c->tangent_accum[1] = 0.0f;
 }
 
 static void clamp_body_motion(sdph3_body *b) {
@@ -732,16 +995,16 @@ static void clamp_body_motion(sdph3_body *b) {
     }
 }
 
-static void apply_at(sdph3_body *b, const float imp[3], const float r[3]) {
+static void apply_at(sdph3_body *b, const float imp[3], const float r[3],
+                     const float ii[9]) {
     b->vel[0] += imp[0] * b->inv_mass;
     b->vel[1] += imp[1] * b->inv_mass;
     b->vel[2] += imp[2] * b->inv_mass;
-    float tx = r[1] * imp[2] - r[2] * imp[1];
-    float ty = r[2] * imp[0] - r[0] * imp[2];
-    float tz = r[0] * imp[1] - r[1] * imp[0];
-    b->angvel[0] += tx * b->inv_inertia;
-    b->angvel[1] += ty * b->inv_inertia;
-    b->angvel[2] += tz * b->inv_inertia;
+    float t[3];
+    v3_cross(r, imp, t);
+    b->angvel[0] += ii[0] * t[0] + ii[1] * t[1] + ii[2] * t[2];
+    b->angvel[1] += ii[3] * t[0] + ii[4] * t[1] + ii[5] * t[2];
+    b->angvel[2] += ii[6] * t[0] + ii[7] * t[1] + ii[8] * t[2];
     /* Do NOT clamp here: clamping during the iterations throws away the
      * angular part of an impulse but keeps the linear part, so the solver
      * keeps adding impulses that only translate the body.  That is how a
@@ -767,7 +1030,8 @@ static void contact_vel(const contact3 *c, float dv[3]) {
     dv[2] = pb[2] - pa[2];
 }
 
-static void solve_contact3(contact3 *c) {
+static void solve_contact3(contact3 *c, const float iia[9],
+                           const float iib[9]) {
     sdph3_body *a = c->a, *b = c->b;
     float dv[3];
     contact_vel(c, dv);
@@ -784,26 +1048,46 @@ static void solve_contact3(contact3 *c) {
     c->normal_accum = accum;
     float imp[3] = { lambda * c->n[0], lambda * c->n[1], lambda * c->n[2] };
     float neg[3] = { -imp[0], -imp[1], -imp[2] };
-    apply_at(a, neg, c->ra);
-    apply_at(b, imp, c->rb);
+    apply_at(a, neg, c->ra, iia);
+    apply_at(b, imp, c->rb, iib);
+}
 
-    /* the friction (the upper bound uses the accumulated normal impulse) */
-    float t[3];
-    v3_tangent(c->n, t);
+/* the friction of one contact: BOTH tangents are solved (a single tangent
+ * lets the body slide sideways and turn around the free axis), and the
+ * accumulated impulse is clamped to the friction circle of the normal
+ * impulse - without the clamp the friction can grow without a limit and
+ * inject energy. */
+static void solve_friction3(contact3 *c, const float iia[9],
+                            const float iib[9]) {
+    sdph3_body *a = c->a, *b = c->b;
+    float t1[3], t2[3];
+    v3_tangents(c->n, t1, t2);
+    float dv[3];
     contact_vel(c, dv);
-    float vt = v3_dot(dv, t);
-    float lt = -vt * c->tangent_mass;
+    float v1 = v3_dot(dv, t1);
+    float v2 = v3_dot(dv, t2);
+    float l1 = -v1 * c->tangent_mass[0];
+    float l2 = -v2 * c->tangent_mass[1];
     float maxf = c->friction * c->normal_accum;
-    float oldt = c->tangent_accum;
-    float accumt = oldt + lt;
-    if (accumt > maxf) accumt = maxf;
-    if (accumt < -maxf) accumt = -maxf;
-    lt = accumt - oldt;
-    c->tangent_accum = accumt;
-    float fi[3] = { lt * t[0], lt * t[1], lt * t[2] };
+    float n1 = c->tangent_accum[0] + l1;
+    float n2 = c->tangent_accum[1] + l2;
+    float mag = sqrtf(n1 * n1 + n2 * n2);
+    if (mag > maxf && mag > 1e-8f) {
+        float s = maxf / mag;
+        n1 *= s;
+        n2 *= s;
+    }
+    l1 = n1 - c->tangent_accum[0];
+    l2 = n2 - c->tangent_accum[1];
+    c->tangent_accum[0] = n1;
+    c->tangent_accum[1] = n2;
+
+    float fi[3];
+    for (int k = 0; k < 3; ++k)
+        fi[k] = l1 * t1[k] + l2 * t2[k];
     float fn[3] = { -fi[0], -fi[1], -fi[2] };
-    apply_at(a, fn, c->ra);
-    apply_at(b, fi, c->rb);
+    apply_at(a, fn, c->ra, iia);
+    apply_at(b, fi, c->rb, iib);
 }
 
 /* --------------------------------------------------------- the world step */
@@ -812,25 +1096,37 @@ void sdph3_step(sdph3_world *w, float dt) {
     if (!w || dt <= 0.0f) return;
     if (w->iterations < 1) w->iterations = 1;
 
-    float damp = 1.0f / (1.0f + w->damping * dt * 60.0f);
-    float adamp = 1.0f / (1.0f + w->ang_damping * dt * 60.0f);
+    /* the damping is frame rate independent: the factor is the fraction of
+     * the velocity that is lost per second (a damping of 0.05 loses 5% of
+     * the speed in one second, no matter how many frames there are) */
+    float damp = 1.0f / (1.0f + w->damping * dt);
+    float adamp = 1.0f / (1.0f + w->ang_damping * dt);
 
+    /* 1: the external forces */
     for (int i = 0; i < w->count; ++i) {
-        sdph3_body *b = &w->bodies[i];
+        sdph3_body *b = w->bodies[i];
+        if (b->type != SDPH3_DYNAMIC) continue;
         if (b->inv_mass <= 0.0f || b->sleeping) continue;
+        float ld = (b->linear_damping > 0.0f)
+                   ? 1.0f / (1.0f + b->linear_damping * dt) : damp;
+        float ad = (b->angular_damping > 0.0f)
+                   ? 1.0f / (1.0f + b->angular_damping * dt) : adamp;
         for (int k = 0; k < 3; ++k) {
             b->vel[k] += w->gravity[k] * dt;
-            b->vel[k] *= damp;
-            b->angvel[k] *= adamp;
+            b->vel[k] *= ld;
+            b->angvel[k] *= ad;
         }
     }
+
+    /* 2: the integration of the positions and the orientations */
     for (int i = 0; i < w->count; ++i) {
-        sdph3_body *b = &w->bodies[i];
+        sdph3_body *b = w->bodies[i];
+        if (b->type != SDPH3_DYNAMIC) continue;
         if (b->inv_mass <= 0.0f || b->sleeping) continue;
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 3; ++k)
             b->pos[k] += b->vel[k] * dt;
-            b->angle[k] += b->angvel[k] * dt;
-        }
+        quat_integrate(b->quat, b->angvel, dt);
+        euler_from_quat(b->angle, b->quat);
     }
 
     ph3_cache *cache = cache_get(w);
@@ -839,11 +1135,13 @@ void sdph3_step(sdph3_world *w, float dt) {
     if (cache && cache_reserve(cache, w->count) == 0 &&
         cache_reserve_contacts(cache, MAX_CONTACTS3) == 0) {
         cs = cache->contacts;
-        /* the bounds and the orientation are computed once per step */
+        cache->count = w->count;
+        /* the bounds, the orientation and the inertia are computed once */
         for (int i = 0; i < w->count; ++i) {
-            sdph3_body *b = &w->bodies[i];
+            sdph3_body *b = w->bodies[i];
             float *basis = cache->basis + (size_t)i * 9u;
-            body_basis(b, basis);
+            quat_to_basis(b->quat, basis);
+            body_inv_inertia_world(b, basis, cache->inertia + (size_t)i * 9u);
             body_aabb(b, basis, cache->aabb + (size_t)i * 6u);
             cache->order[i] = i;
         }
@@ -851,16 +1149,18 @@ void sdph3_step(sdph3_world *w, float dt) {
 
         for (int si = 0; si < cache->count && n < MAX_CONTACTS3; ++si) {
             int i = cache->order[si];
-            sdph3_body *a = &w->bodies[i];
+            sdph3_body *a = w->bodies[i];
             const float *ba = cache->aabb + (size_t)i * 6u;
             const float *bas = cache->basis + (size_t)i * 9u;
-            int a_active = (a->inv_mass > 0.0f) && !a->sleeping;
+            const float *bia = cache->inertia + (size_t)i * 9u;
+            int a_active = (a->type == SDPH3_DYNAMIC) && !a->sleeping;
             for (int sj = si + 1; sj < cache->count && n < MAX_CONTACTS3; ++sj) {
                 int k = cache->order[sj];
                 const float *bb = cache->aabb + (size_t)k * 6u;
                 if (bb[0] > ba[3]) break;          /* the sweep ends here */
-                sdph3_body *b = &w->bodies[k];
-                int b_active = (b->inv_mass > 0.0f) && !b->sleeping;
+                sdph3_body *b = w->bodies[k];
+                const float *bib = cache->inertia + (size_t)k * 9u;
+                int b_active = (b->type == SDPH3_DYNAMIC) && !b->sleeping;
                 if (!a_active && !b_active) continue;
                 if (ba[4] < bb[1] || bb[4] < ba[1]) continue;  /* the Y overlap */
                 if (ba[5] < bb[2] || bb[5] < ba[2]) continue;  /* the Z overlap */
@@ -869,14 +1169,14 @@ void sdph3_step(sdph3_world *w, float dt) {
                  * otherwise it receives an impulse but skips the support of
                  * the bodies under it for this step and gets squeezed through
                  * them */
-                if (a_active && b->sleeping && b->inv_mass > 0.0f &&
+                if (a_active && b->sleeping && b->type == SDPH3_DYNAMIC &&
                     (a->vel[0] * a->vel[0] + a->vel[1] * a->vel[1] +
                      a->vel[2] * a->vel[2]) > 0.16f) {
                     b->sleeping = 0;
                     b->sleep_timer = 0.0f;
                     b_active = 1;
                 }
-                if (b_active && a->sleeping && a->inv_mass > 0.0f &&
+                if (b_active && a->sleeping && a->type == SDPH3_DYNAMIC &&
                     (b->vel[0] * b->vel[0] + b->vel[1] * b->vel[1] +
                      b->vel[2] * b->vel[2]) > 0.16f) {
                     a->sleeping = 0;
@@ -887,7 +1187,7 @@ void sdph3_step(sdph3_world *w, float dt) {
                 int nc = collide3(a, b, bas,
                                   cache->basis + (size_t)k * 9u, tmp);
                 for (int t = 0; t < nc && n < MAX_CONTACTS3; ++t) {
-                    prepare_contact3(&tmp[t], dt);
+                    prepare_contact3(&tmp[t], dt, bia, bib);
                     cs[n++] = tmp[t];
                 }
             }
@@ -895,15 +1195,22 @@ void sdph3_step(sdph3_world *w, float dt) {
     }
     w->contacts = n;
 
-    for (int it = 0; it < w->iterations; ++it)
+    /* 3: the solver - all the normal impulses first, then all the friction
+     * ones.  Solving them together lets the rotation caused by one contact
+     * fight the friction of the next one and the box starts to buzz. */
+    for (int it = 0; it < w->iterations; ++it) {
         for (int i = 0; i < n; ++i)
-            solve_contact3(&cs[i]);
+            solve_contact3(&cs[i], cs[i].iia, cs[i].iib);
+        for (int i = 0; i < n; ++i)
+            solve_friction3(&cs[i], cs[i].iia, cs[i].iib);
+    }
 
+    /* 4: the positional correction (so the bodies do not sink) */
     for (int i = 0; i < n; ++i) {
         contact3 *c = &cs[i];
         float total = c->a->inv_mass + c->b->inv_mass;
         if (total <= 0.0f) continue;
-        float corr = (c->depth - 0.01f) * 0.4f / total;
+        float corr = (c->depth - SDPH3_SLOP) * 0.4f / total;
         if (corr <= 0.0f) continue;
         /* never teleport a body by more than a fraction of a unit per step */
         if (corr * c->a->inv_mass > 0.2f) corr = 0.2f / c->a->inv_mass;
@@ -914,19 +1221,36 @@ void sdph3_step(sdph3_world *w, float dt) {
         }
     }
 
+    /* 5: the world bounds */
     if (w->use_bounds) {
         for (int i = 0; i < w->count; ++i) {
-            sdph3_body *b = &w->bodies[i];
+            sdph3_body *b = w->bodies[i];
             if (b->inv_mass <= 0.0f) continue;
-            float r = (b->shape == SDPH3_SPHERE) ? b->radius : b->bound;
+            /* the half extents of the body along the world axes */
+            float ext[3];
+            if (b->shape == SDPH3_SPHERE) {
+                ext[0] = ext[1] = ext[2] = b->radius;
+            } else {
+                float m[9];
+                quat_to_basis(b->quat, m);
+                for (int k = 0; k < 3; ++k) {
+                    float s = 0.0f;
+                    for (int q = 0; q < 3; ++q) {
+                        float ax[3];
+                        basis_axis(m, q, ax);
+                        s += fabsf(ax[k]) * b->half[q];
+                    }
+                    ext[k] = s;
+                }
+            }
             for (int k = 0; k < 3; ++k) {
-                if (b->pos[k] - r < w->bounds[k]) {
-                    b->pos[k] = w->bounds[k] + r;
+                if (b->pos[k] - ext[k] < w->bounds[k]) {
+                    b->pos[k] = w->bounds[k] + ext[k];
                     if (b->vel[k] < 0.0f) b->vel[k] = -b->vel[k] * b->restitution;
                     b->sleeping = 0;
                 }
-                if (b->pos[k] + r > w->bounds[k + 3]) {
-                    b->pos[k] = w->bounds[k + 3] - r;
+                if (b->pos[k] + ext[k] > w->bounds[k + 3]) {
+                    b->pos[k] = w->bounds[k + 3] - ext[k];
                     if (b->vel[k] > 0.0f) b->vel[k] = -b->vel[k] * b->restitution;
                     b->sleeping = 0;
                 }
@@ -934,8 +1258,10 @@ void sdph3_step(sdph3_world *w, float dt) {
         }
     }
 
+    /* 6: the sleeping */
     for (int i = 0; i < w->count; ++i) {
-        sdph3_body *b = &w->bodies[i];
+        sdph3_body *b = w->bodies[i];
+        if (b->type != SDPH3_DYNAMIC) continue;
         if (b->inv_mass <= 0.0f) continue;
         /* the safety caps: an unresolved overlap must not launch the body */
         clamp_body_motion(b);
