@@ -15,15 +15,18 @@
 
 static float *m_to_f32(const sdge_accessor *a, int normalized_default) {
     if (a->count <= 0 || a->comps <= 0) return NULL;
-    if (a->ctype == SDGE_GLTF_FLOAT && !a->normalized)
-        return NULL;
 
     int n = a->count * a->comps;
+    int csz = (a->ctype == SDGE_GLTF_BYTE || a->ctype == SDGE_GLTF_UNSIGNED_BYTE) ? 1
+            : (a->ctype == SDGE_GLTF_SHORT || a->ctype == SDGE_GLTF_UNSIGNED_SHORT) ? 2 : 4;
+    int stride = a->stride ? a->stride : a->comps * csz;
+    if (a->ctype == SDGE_GLTF_FLOAT && !a->normalized
+        && stride == a->comps * (int)sizeof(float))
+        return NULL;
+
     float *out = (float *)malloc(sizeof(float) * (size_t)n);
     if (!out) return NULL;
 
-    int csz = (a->ctype == SDGE_GLTF_BYTE || a->ctype == SDGE_GLTF_UNSIGNED_BYTE) ? 1
-            : (a->ctype == SDGE_GLTF_SHORT || a->ctype == SDGE_GLTF_UNSIGNED_SHORT) ? 2 : 4;
     int norm = a->normalized || (normalized_default && a->ctype != SDGE_GLTF_FLOAT);
     float maxv = (a->ctype == SDGE_GLTF_BYTE) ? 127.0f
               : (a->ctype == SDGE_GLTF_UNSIGNED_BYTE) ? 255.0f
@@ -32,7 +35,7 @@ static float *m_to_f32(const sdge_accessor *a, int normalized_default) {
 
     for (int i = 0; i < n; ++i) {
         const unsigned char *p = a->data
-            + (size_t)(i / a->comps) * (size_t)a->stride
+            + (size_t)(i / a->comps) * (size_t)stride
             + (size_t)(i % a->comps) * (size_t)csz;
         float v = 0.0f;
         switch (a->ctype) {
@@ -123,14 +126,26 @@ SDGE_API int sdge_mesh_upload(sdge_mesh *out, const sdge_primitive *prim,
         if (!jw) { sdge_mesh_destroy(out); return -2; }
         float *joints  = m_to_f32(&prim->joints, 0);
         float *weights = m_to_f32(&prim->weights, 1);
-        if (joints && weights) {
+        const float *joint_values = joints;
+        const float *weight_values = weights;
+        if (!joint_values && prim->joints.ctype == SDGE_GLTF_FLOAT
+            && !prim->joints.normalized
+            && (prim->joints.stride == 0
+                || prim->joints.stride == 4 * (int)sizeof(float)))
+            joint_values = (const float *)prim->joints.data;
+        if (!weight_values && prim->weights.ctype == SDGE_GLTF_FLOAT
+            && !prim->weights.normalized
+            && (prim->weights.stride == 0
+                || prim->weights.stride == 4 * (int)sizeof(float)))
+            weight_values = (const float *)prim->weights.data;
+        if (joint_values && weight_values) {
             for (int i = 0; i < prim->positions.count; ++i) {
-                float wsum = weights[i*4+0] + weights[i*4+1]
-                           + weights[i*4+2] + weights[i*4+3];
+                float wsum = weight_values[i*4+0] + weight_values[i*4+1]
+                           + weight_values[i*4+2] + weight_values[i*4+3];
                 float inv = wsum > 1e-6f ? 1.0f / wsum : 0.0f;
                 for (int k = 0; k < 4; ++k) {
-                    jw[i*8+k]   = joints[i*4+k];
-                    jw[i*8+4+k] = weights[i*4+k] * inv;
+                    jw[i*8+k]   = joint_values[i*4+k];
+                    jw[i*8+4+k] = weight_values[i*4+k] * inv;
                 }
             }
             glGenBuffers(1, &out->vbo_skin);

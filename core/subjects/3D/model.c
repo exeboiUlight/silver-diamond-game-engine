@@ -685,9 +685,16 @@ SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model) {
             sdge_mesh *gpu = &m->prims[n->mesh][p];
             if (!gpu->vao) continue;
 
+            int skinned = gpu->has_skin && joints && joint_count > 0;
+            sdg_mat4 draw_world;
+            if (skinned) m4_copy(draw_world, base);
+            else         m4_copy(draw_world, world);
+
             float center[3], radius;
             sdge_mesh_world_sphere(gpu, world, center, &radius);
-            if (!sdgr_sphere_visible(center, radius)) continue;
+            if (!skinned || !m->active) {
+                if (!sdgr_sphere_visible(center, radius)) continue;
+            }
 
             int mat_index = mesh->prims[p].material;
             const sdgr_material *mat = NULL;
@@ -736,7 +743,7 @@ SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model) {
             }
             m_item *it = &items[count++];
             it->gpu = gpu;
-            m4_copy(it->world, world);
+            m4_copy(it->world, draw_world);
             it->joints = joints;
             it->joint_count = joint_count;
             it->mat = mat;
