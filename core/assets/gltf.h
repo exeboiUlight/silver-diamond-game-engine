@@ -247,8 +247,11 @@ static int g_comps_of_type(const char *t) {
 }
 
 typedef struct {
-    const unsigned char *bin;    /* buffer 0 data (arena-owned) */
-    size_t bin_len;
+    const unsigned char **data;
+    size_t *length;
+    int count;
+    const unsigned char *glb_bin;
+    size_t glb_bin_len;
 } g_buffers;
 
 /* parse one accessor token into a resolved view; returns 0 on success */
@@ -281,6 +284,7 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     size_t view_off = 0;
     int stride = 0;
     const unsigned char *base = NULL;
+    size_t buffer_len = 0;
     if (view_tok >= 0) {
         int vi = (int)sdj_num(d, view_tok);
         int views = sdj_obj_get(d, 0, "bufferViews");
@@ -289,8 +293,9 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
         view_off = (size_t)sdj_num(d, sdj_obj_get(d, vt, "byteOffset"));
         stride   = (int)sdj_num(d, sdj_obj_get(d, vt, "byteStride"));
         int buffer_idx = (int)sdj_num(d, sdj_obj_get(d, vt, "buffer"));
-        if (buffer_idx != 0) return -4;
-        base = bufs->bin;
+        if (buffer_idx < 0 || buffer_idx >= bufs->count) return -4;
+        base = bufs->data[buffer_idx];
+        buffer_len = bufs->length[buffer_idx];
         if (!base) return -5;
     } else {
         return -6;                                     /* sparse unsupported */
@@ -299,10 +304,10 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
     int csz = g_ctype_size(ctype);
     if (stride == 0) stride = comps * csz;
     const unsigned char *data = base + view_off + (size_t)off;
-    if ((size_t)(data - base) > bufs->bin_len) return -7;
+    if ((size_t)(data - base) > buffer_len) return -7;
     if (count > 0
         && (size_t)(data - base) + (size_t)(count - 1) * (size_t)stride
-               + (size_t)(comps * csz) > bufs->bin_len)
+               + (size_t)(comps * csz) > buffer_len)
         return -8;
 
     out->data = data;
@@ -323,13 +328,33 @@ static int g_parse_accessor(sdj_doc *d, int acc, const g_buffers *bufs,
 
 static float *g_accessor_to_f32(sdge_gltf_model *m, const sdge_accessor *a) {
     int n = a->count * a->comps;
+    if (n <= 0 || !a->data) return NULL;
     float *out = (float *)sdga_alloc(&m->arena, sizeof(float) * (size_t)n);
     if (!out) return NULL;
     int csz = g_ctype_size(a->ctype);
+    /* normalized integer accessors must be rescaled into [0,1] / [-1,1]
+     * (skin weights and animation values are frequently stored this way) */
+    float norm_scale = 1.0f;
+    if (a->normalized) {
+        switch (a->ctype) {
+        case SDGE_GLTF_BYTE:          norm_scale = 1.0f / 127.0f;  break;
+        case SDGE_GLTF_UNSIGNED_BYTE: norm_scale = 1.0f / 255.0f;  break;
+        case SDGE_GLTF_SHORT:         norm_scale = 1.0f / 32767.0f; break;
+        case SDGE_GLTF_UNSIGNED_SHORT:norm_scale = 1.0f / 65535.0f; break;
+        case SDGE_GLTF_UNSIGNED_INT:  norm_scale = 1.0f / 4294967295.0f; break;
+        default: norm_scale = 1.0f; break;
+        }
+    }
     for (int i = 0; i < n; ++i) {
         const unsigned char *p = a->data + (size_t)(i / a->comps) * (size_t)a->stride
                                + (size_t)(i % a->comps) * (size_t)csz;
-        out[i] = g_comp_f32(p, a->ctype);
+        float v = g_comp_f32(p, a->ctype);
+        if (a->normalized && norm_scale != 1.0f) {
+            v *= norm_scale;
+            /* signed normalized values clamp at -1 (spec: max(v / max, -1)) */
+            if (v < -1.0f) v = -1.0f;
+        }
+        out[i] = v;
     }
     return out;
 }
@@ -363,6 +388,42 @@ static char *g_strdup_raw(sdge_gltf_model *m, const sdj_doc *d, int t,
     return out;
 }
 
+static int g_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* decodes %XX escapes in place ("My%20Texture.png" -> "My Texture.png");
+ * URIs in downloaded models are often percent-encoded */
+static void g_uri_decode(char *s) {
+    char *w = s;
+    for (const char *r = s; *r; ++r) {
+        if (*r == '%' && r[1] && r[2]) {
+            int hi = g_hexval(r[1]), lo = g_hexval(r[2]);
+            if (hi >= 0 && lo >= 0) {
+                *w++ = (char)((hi << 4) | lo);
+                r += 2;
+                continue;
+            }
+        }
+        *w++ = *r;
+    }
+    *w = '\0';
+}
+
+/* duplicates an URI/string token and percent-decodes it (arena owned) */
+static char *g_strdup_uri(sdge_gltf_model *m, const sdj_doc *d, int t,
+                          int *len_out) {
+    char *out = g_strdup_raw(m, d, t, len_out);
+    if (out) {
+        g_uri_decode(out);
+        if (len_out) *len_out = (int)strlen(out);
+    }
+    return out;
+}
+
 /* ---------------------------------------------------------------- base64
  * glTF allows "data:<mime>;base64,<payload>" URIs for buffers and images.
  * The decoder is allocation-light: it returns a malloc'ed buffer the caller
@@ -381,13 +442,14 @@ static unsigned char *g_base64_decode(const char *src, size_t srclen,
     unsigned char *out = (unsigned char *)malloc(srclen / 4u * 3u + 4u);
     if (!out) return NULL;
     size_t o = 0;
-    int acc = 0, bits = 0;
+    unsigned int acc = 0;
+    int bits = 0;
     for (size_t i = 0; i < srclen; ++i) {
         char c = src[i];
         if (c == '=' ) break;
         int v = g_b64_value(c);
         if (v < 0) continue;                 /* skip whitespace/newlines */
-        acc = (acc << 6) | v;
+        acc = (acc << 6) | (unsigned int)v;
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -464,15 +526,11 @@ SDGE_API void sdge_gltf_destroy(sdge_gltf_model *m) {
     free(m);
 }
 
-static int g_load_buffer0(sdj_doc *d, const char *gltf_path,
-                          sdge_gltf_model *m, g_buffers *bufs) {
-    int bufs_tok = sdj_obj_get(d, 0, "buffers");
-    int b0 = sdj_arr_at(d, bufs_tok, 0);
-    if (b0 < 0) return -1;
-    int uri = sdj_obj_get(d, b0, "uri");
-    if (uri < 0) return -2;
-
-    char ubuf[512];
+static int g_load_buffer_uri(sdj_doc *d, int uri, const char *gltf_path,
+                             sdge_gltf_model *m,
+                             const unsigned char **data_out,
+                             size_t *length_out) {
+    char ubuf[1024];
     int ulen = 0;
     const char *raw = g_str_raw(d, uri, &ulen);
     if (!raw) return -3;
@@ -486,16 +544,17 @@ static int g_load_buffer0(sdj_doc *d, const char *gltf_path,
         if (!copy) { free(dec); return -7; }
         memcpy(copy, dec, len);
         free(dec);
-        bufs->bin = copy;
-        bufs->bin_len = len;
+        *data_out = copy;
+        *length_out = len;
         return 0;
     }
 
     if (ulen > (int)sizeof(ubuf) - 1) return -3;
     memcpy(ubuf, raw, (size_t)ulen);
     ubuf[ulen] = '\0';
+    g_uri_decode(ubuf);
 
-    char path[1024];
+    char path[2048];
     const char *slash = strrchr(gltf_path, '/');
     const char *bslash = strrchr(gltf_path, '\\');
     const char *sep = (slash && (!bslash || slash > bslash)) ? slash : bslash;
@@ -516,8 +575,8 @@ static int g_load_buffer0(sdj_doc *d, const char *gltf_path,
     if (!arena_copy) { free(data); return -7; }
     memcpy(arena_copy, data, size);
     free(data);
-    bufs->bin = arena_copy;
-    bufs->bin_len = size;
+    *data_out = arena_copy;
+    *length_out = size;
     return 0;
 }
 
@@ -556,13 +615,13 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                 text[clen] = '\0';
                 json = text;
                 have_json = 1;
-            } else if (ctype == 0x004E4942u /*BIN\0*/ && !bufs.bin) {
+            } else if (ctype == 0x004E4942u /*BIN\0*/ && !bufs.glb_bin) {
                 unsigned char *bin = (unsigned char *)sdga_alloc(&m->arena,
                                                                  clen ? clen : 1);
                 if (!bin) goto fail;
                 memcpy(bin, body, clen);
-                bufs.bin = bin;
-                bufs.bin_len = clen;
+                bufs.glb_bin = bin;
+                bufs.glb_bin_len = clen;
             }
             pos += 8 + clen + ((clen & 3) ? (4 - (clen & 3)) : 0);
         }
@@ -578,28 +637,102 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
     file = NULL;
 
     /* ---- parse JSON ---- */
-    sdj_token *toks = (sdj_token *)malloc(sizeof(sdj_token) * SDJ_MAX_TOKENS);
+    /* The token count of a real scene is far above the old 4096 cap: a
+     * 90 KB glTF easily needs ~20k tokens. Count once, then allocate. */
+    int max_tokens = sdj_count_tokens(json);
+    if (max_tokens < 16) max_tokens = 16;
+    sdj_token *toks = (sdj_token *)malloc(sizeof(sdj_token)
+                                          * (size_t)max_tokens);
     if (!toks) goto fail;
     sdj_doc doc;
-    sdj_init(&doc, json, toks);
+    sdj_init_ex(&doc, json, toks, max_tokens);
     if (doc.count <= 0 || doc.tok[0].type != SDJ_OBJECT) {
         free(toks);
-        fprintf(stderr, "gltf: bad JSON (%d)\n", doc.count);
+        if (doc.count == -1)
+            fprintf(stderr, "gltf: JSON has more than %d tokens in '%s'\n",
+                    max_tokens, path);
+        else
+            fprintf(stderr, "gltf: bad JSON in '%s' (parser error %d)\n",
+                    path, doc.count);
         goto fail;
     }
 
     {
+        /* Be permissive: a downloaded model may declare extensions we can
+         * ignore (KHR_materials_*, KHR_texture_transform, lights...) and
+         * still render fine. Only compression is genuinely fatal. */
         int ext = sdj_obj_get(&doc, 0, "extensionsRequired");
-        if (sdj_len(&doc, ext) > 0) {
-            fprintf(stderr, "gltf: model requires unsupported extensions\n");
-            free(toks);
-            goto fail;
+        int n = sdj_len(&doc, ext);
+        for (int i = 0; i < n; ++i) {
+            char name[64];
+            name[0] = '\0';
+            sdj_str(&doc, sdj_arr_at(&doc, ext, i), name, (int)sizeof(name));
+            if (!strcmp(name, "KHR_draco_mesh_compression")
+                || !strcmp(name, "EXT_meshopt_compression")) {
+                fprintf(stderr, "gltf: '%s' requires compressed geometry (%s); "
+                        "the mesh will be empty\n", path, name);
+            } else if (name[0]
+                && strcmp(name, "KHR_texture_transform")
+                && strcmp(name, "KHR_materials_pbrSpecularGlossiness")
+                && strcmp(name, "KHR_materials_emissive_strength")
+                && strcmp(name, "KHR_materials_unlit")
+                && strcmp(name, "KHR_mesh_quantization")) {
+                fprintf(stderr, "gltf: warning: ignoring required extension "
+                        "'%s' in '%s'\n", name, path);
+            }
         }
     }
 
-    if (!is_glb && !bufs.bin) {
-        if (g_load_buffer0(&doc, path, m, &bufs) != 0) {
-            /* model without binary data - keep going */
+    {
+        int arr = sdj_obj_get(&doc, 0, "buffers");
+        bufs.count = sdj_len(&doc, arr);
+        if (bufs.count > 0) {
+            bufs.data = (const unsigned char **)sdga_alloc(
+                &m->arena, sizeof(*bufs.data) * (size_t)bufs.count);
+            bufs.length = (size_t *)sdga_alloc(
+                &m->arena, sizeof(*bufs.length) * (size_t)bufs.count);
+            if (!bufs.data || !bufs.length) { free(toks); goto fail; }
+            memset(bufs.data, 0, sizeof(*bufs.data) * (size_t)bufs.count);
+            memset(bufs.length, 0, sizeof(*bufs.length) * (size_t)bufs.count);
+            if (bufs.glb_bin) {
+                bufs.data[0] = bufs.glb_bin;
+                bufs.length[0] = bufs.glb_bin_len;
+            }
+
+            for (int i = 0; i < bufs.count; ++i) {
+                int bt = sdj_arr_at(&doc, arr, i);
+                int uri = sdj_obj_get(&doc, bt, "uri");
+                if (!bufs.data[i] && uri >= 0) {
+                    int rc = g_load_buffer_uri(&doc, uri, path, m,
+                                               &bufs.data[i],
+                                               &bufs.length[i]);
+                    if (rc != 0) {
+                        fprintf(stderr, "gltf: cannot load buffer %d for '%s' (%d)\n",
+                                i, path, rc);
+                        free(toks);
+                        goto fail;
+                    }
+                }
+                int length_tok = sdj_obj_get(&doc, bt, "byteLength");
+                size_t expected = (size_t)sdj_num(&doc, length_tok);
+                if (!bufs.data[i] || bufs.length[i] == 0) {
+                    fprintf(stderr, "gltf: invalid or missing buffer %d in '%s'\n",
+                            i, path);
+                    free(toks);
+                    goto fail;
+                }
+                if (length_tok < 0 || expected == 0) {
+                    fprintf(stderr, "gltf: warning: buffer %d has no byteLength "
+                            "in '%s'\n", i, path);
+                } else if (expected > bufs.length[i]) {
+                    /* some exporters overstate byteLength; the accessor
+                     * bounds checks below still keep reads in range */
+                    fprintf(stderr, "gltf: warning: buffer %d declares %lu bytes "
+                            "but only %lu are present in '%s'\n", i,
+                            (unsigned long)expected,
+                            (unsigned long)bufs.length[i], path);
+                }
+            }
         }
     }
 
@@ -619,10 +752,11 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                 int len = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "byteLength"));
                 int stride = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "byteStride"));
                 int buf_idx = (int)sdj_num(&doc, sdj_obj_get(&doc, vt, "buffer"));
-                if (buf_idx != 0 || !bufs.bin) continue;
+                if (buf_idx < 0 || buf_idx >= bufs.count
+                    || !bufs.data[buf_idx]) continue;
                 if (off < 0 || len <= 0) continue;
-                if ((size_t)off + (size_t)len > bufs.bin_len) continue;
-                m->buffer_views[i].data = bufs.bin + off;
+                if ((size_t)off + (size_t)len > bufs.length[buf_idx]) continue;
+                m->buffer_views[i].data = bufs.data[buf_idx] + off;
                 m->buffer_views[i].byte_length = len;
                 m->buffer_views[i].byte_offset = off;
                 m->buffer_views[i].byte_stride = stride;
@@ -946,7 +1080,7 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                         }
                         free(dec);
                     } else if (raw) {
-                        im->uri = g_strdup_raw(m, &doc, uri, &im->uri_len);
+                        im->uri = g_strdup_uri(m, &doc, uri, &im->uri_len);
                     }
                 }
             }
@@ -1059,6 +1193,41 @@ SDGE_API sdge_gltf_model *sdge_load_gltf(const char *path) {
                             m->texture_count, &mat->occlusion_tex);
             g_parse_texinfo(&doc, sdj_obj_get(&doc, mt, "emissiveTexture"),
                             m->texture_count, &mat->emissive_tex);
+
+            /* Legacy Sketchfab-style materials: KHR_materials_pbrSpecular-
+             * Glossiness only carries diffuse + glossiness, so approximate
+             * them with the metallic-roughness fields. */
+            int exts = sdj_obj_get(&doc, mt, "extensions");
+            int sg = sdj_obj_get(&doc, exts,
+                                 "KHR_materials_pbrSpecularGlossiness");
+            if (sg >= 0) {
+                int df = sdj_obj_get(&doc, sg, "diffuseFactor");
+                if (sdj_len(&doc, df) == 4)
+                    for (int k = 0; k < 4; ++k)
+                        mat->base_color[k] = (float)sdj_num(&doc,
+                                                    sdj_arr_at(&doc, df, k));
+                int dt = sdj_obj_get(&doc, sg, "diffuseTexture");
+                if (dt >= 0 && mat->base_color_tex.index < 0)
+                    g_parse_texinfo(&doc, dt, m->texture_count,
+                                    &mat->base_color_tex);
+                int gf = sdj_obj_get(&doc, sg, "glossinessFactor");
+                mat->roughness = 0.0f;         /* glossiness defaults to 1 */
+                if (gf >= 0) {
+                    float g = (float)sdj_num(&doc, gf);
+                    mat->roughness = 1.0f - g;
+                }
+                mat->metallic = 0.0f;
+            }
+
+            /* KHR_materials_emissive_strength: scale the emissive factor */
+            int es = sdj_obj_get(&doc, exts, "KHR_materials_emissive_strength");
+            if (es >= 0) {
+                int st = sdj_obj_get(&doc, es, "emissiveStrength");
+                if (st >= 0) {
+                    float s = (float)sdj_num(&doc, st);
+                    for (int k = 0; k < 3; ++k) mat->emissive[k] *= s;
+                }
+            }
         }
     }
 

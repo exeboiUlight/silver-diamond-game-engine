@@ -25,7 +25,47 @@
 extern "C" {
 #endif
 
+/* Default capacity for sdj_init(): enough for small configs, NOT for real
+ * glTF scenes. Use sdj_count_tokens() + sdj_init_ex() for those. */
 #define SDJ_MAX_TOKENS 4096
+
+/* Exact token count of a JSON text (lexical scan, no storage). Used to size
+ * the token buffer for big scenes and for .gltf files with base64 payloads,
+ * where a length-based estimate would allocate hundreds of megabytes. */
+SDGE_INLINE int sdj_count_tokens(const char *js) {
+    if (!js) return 0;
+    int pos = 0, count = 0;
+    if ((unsigned char)js[0] == 0xEF && (unsigned char)js[1] == 0xBB
+        && (unsigned char)js[2] == 0xBF)
+        pos = 3;
+    while (js[pos] != '\0') {
+        char c = js[pos];
+        if (c == '{' || c == '[') {
+            count++;
+            pos++;
+        } else if (c == '}' || c == ']') {
+            pos++;
+        } else if (c == '"') {
+            count++;
+            pos++;
+            while (js[pos] != '\0' && js[pos] != '"') {
+                if (js[pos] == '\\' && js[pos + 1] != '\0') pos++;
+                pos++;
+            }
+            if (js[pos] == '"') pos++;
+        } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n'
+                   || c == ',' || c == ':') {
+            pos++;
+        } else {
+            count++;
+            while (js[pos] != '\0' && js[pos] != ',' && js[pos] != '}'
+                   && js[pos] != ']' && js[pos] != ' ' && js[pos] != '\t'
+                   && js[pos] != '\r' && js[pos] != '\n')
+                pos++;
+        }
+    }
+    return count;
+}
 
 typedef enum {
     SDJ_UNDEFINED = 0,
@@ -52,6 +92,10 @@ typedef struct {
 /* ------------------------------ parser ------------------------------ */
 SDGE_INLINE int sdj_parse(const char *js, sdj_token *tok, int max) {
     int pos = 0, tp = 0, dtop = -1;
+    /* tolerate a UTF-8 BOM (very common in .gltf files saved on Windows) */
+    if ((unsigned char)js[0] == 0xEF && (unsigned char)js[1] == 0xBB
+        && (unsigned char)js[2] == 0xBF)
+        pos = 3;
     while (js[pos] != '\0') {
         char c = js[pos];
         if (c == '{' || c == '[') {
@@ -108,10 +152,17 @@ SDGE_INLINE int sdj_parse(const char *js, sdj_token *tok, int max) {
     return tp;
 }
 
-SDGE_INLINE void sdj_init(sdj_doc *d, const char *text, sdj_token *tokbuf) {
+/* parse with an explicit token capacity (tokbuf must hold max tokens) */
+SDGE_INLINE void sdj_init_ex(sdj_doc *d, const char *text, sdj_token *tokbuf,
+                             int max_tokens) {
     d->src = text;
     d->tok = tokbuf;
-    d->count = sdj_parse(text, tokbuf, SDJ_MAX_TOKENS);
+    d->count = sdj_parse(text, tokbuf, max_tokens);
+}
+
+/* legacy helper: fixed SDJ_MAX_TOKENS capacity */
+SDGE_INLINE void sdj_init(sdj_doc *d, const char *text, sdj_token *tokbuf) {
+    sdj_init_ex(d, text, tokbuf, SDJ_MAX_TOKENS);
 }
 
 /* --------------------------- navigation ---------------------------- */
