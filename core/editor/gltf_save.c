@@ -20,6 +20,13 @@
 #include <stdarg.h>
 #include <math.h>
 
+#ifdef _WIN32
+    #include <direct.h>
+#else
+    #include <sys/stat.h>
+    #include <sys/types.h>
+#endif
+
 /* a copy of a text (strdup is not part of C99) */
 static char *dup_text(const char *text) {
     if (!text) text = "";
@@ -356,6 +363,29 @@ static void dir_of(const char *path, char *out, size_t size) {
     out[len] = '\0';
 }
 
+/* creates every missing directory of the directory part of a path */
+static void make_dirs(const char *path) {
+    char dir[1024];
+    dir_of(path, dir, sizeof(dir));
+    if (!dir[0]) return;
+    for (char *p = dir + 1; *p; ++p) {
+        if (*p != '/' && *p != '\\') continue;
+        char sep = *p;
+        *p = '\0';
+#ifdef _WIN32
+        _mkdir(dir);
+#else
+        mkdir(dir, 0755);
+#endif
+        *p = sep;
+    }
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+}
+
 /* the path of a file that is relative to the model */
 static void resolve_path(const char *dir, const char *uri, char *out,
                          size_t size) {
@@ -452,6 +482,7 @@ SDGE_API int sdge_editor_export(sdge_editor *ed, const char *path) {
     if (!ed || !path || !path[0]) return -1;
     sdge_model *model = sdge_editor_model(ed);
     if (!model) return -1;
+    int active_object = sdge_editor_active_object(ed);
     const sdge_gltf_model *g = sdge_model_gltf(model);
     if (!g) return -1;
 
@@ -542,7 +573,8 @@ SDGE_API int sdge_editor_export(sdge_editor *ed, const char *path) {
     for (int node = 0; node < g->node_count; ++node) {
         int has_override = 0;
         for (int s = 0; s < SDGR_TEX_SLOTS; ++s) {
-            const char *file = sdge_editor_texture_path(ed, node, s);
+            const char *file = sdge_editor_texture_path_for(ed, active_object,
+                                                            node, s);
             if (file && file[0]) has_override = 1;
         }
         if (!has_override) continue;
@@ -551,7 +583,8 @@ SDGE_API int sdge_editor_export(sdge_editor *ed, const char *path) {
         int tex_index[SDGR_TEX_SLOTS];
         for (int s = 0; s < SDGR_TEX_SLOTS; ++s) tex_index[s] = -1;
         for (int s = 0; s < SDGR_TEX_SLOTS; ++s) {
-            const char *file = sdge_editor_texture_path(ed, node, s);
+            const char *file = sdge_editor_texture_path_for(ed, active_object,
+                                                            node, s);
             if (!file || !file[0]) continue;
             int img = export_image(&st, NULL, file);
             if (img < 0) continue;
@@ -910,6 +943,7 @@ SDGE_API int sdge_editor_export(sdge_editor *ed, const char *path) {
     /* ---- the files ---- */
     char bin_path[1024];
     snprintf(bin_path, sizeof(bin_path), "%s.bin", path);
+    make_dirs(path);
 
     FILE *f = fopen(bin_path, "wb");
     if (!f) {

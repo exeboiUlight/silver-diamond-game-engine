@@ -1,0 +1,33 @@
+/* demos/glow.sdshader - Silver Diamond Game Engine :: custom shader example
+ *
+ * The small shader language of the engine.  A shader may change the vertex
+ * position/normal/UVs and the final fragment color, while the material,
+ * textures, skinning and lights stay the same as in the built-in PBR pass.
+ *
+ * Load it from C:
+ *     sdgr_shader *s = sdgr_shader_load_file("demos/glow.sdshader",
+ *                                            err, sizeof(err));
+ */
+shader glow {
+    uniform float intensity;   /* 0..1, set from the demo each frame */
+    uniform vec3  tint;        /* glow color                         */
+    uniform float speed;       /* animation speed                    */
+
+    vertex {
+        /* a subtle vertical ripple; `time`, `position`, `normal`, `uv`
+           and `uv1` are built in */
+        position.y += sin(time * speed + position.x * 4.0) * 0.02;
+    }
+
+    fragment {
+        /* the built-in surface values of the forward renderer */
+        vec3 lit = pbrLighting(normal, albedo, metallic, roughness);
+
+        /* a moving band based on the world position and time */
+        float band = sin(time * speed * 2.0 + worldPos.y * 10.0) * 0.5 + 0.5;
+
+        color.rgb = lit * (0.65 + 0.35 * band)
+                  + mix(emissive, tint, intensity) * (0.25 + 0.75 * band);
+        color.a = baseColor.a;
+    }
+}

@@ -23,6 +23,7 @@
 #include "../../math/math3d.h"
 #include "../../assets/gltf.h"
 #include "../../graphics/mesh.h"
+#include "../../graphics/renderer.h"
 #include "../../anim/anim.h"
 
 #ifdef __cplusplus
@@ -93,6 +94,19 @@ SDGE_API int sdge_model_set_node_texture(sdge_model *m, int node, int slot,
                                           unsigned texture);
 SDGE_API unsigned sdge_model_get_node_texture(const sdge_model *m, int node,
                                                int slot);
+
+/* ---------------------------------------------------------------- shader
+ * Assigns a custom shader (graphics/renderer.h, section "custom shaders") to
+ * the whole model.  Pass NULL to return to the built-in PBR shader.  The
+ * model does NOT own the shader: keep it alive while it is assigned and
+ * destroy it with sdgr_shader_destroy() afterwards.
+ *
+ *     sdgr_shader *glow = sdgr_shader_load_file("materials/glow.sdshader",
+ *                                               err, sizeof(err));
+ *     sdge_model_set_shader(model, glow);
+ */
+SDGE_API void sdge_model_set_shader(sdge_model *m, sdgr_shader *shader);
+SDGE_API sdgr_shader *sdge_model_shader(const sdge_model *m);
 
 #ifdef __cplusplus
 }

@@ -11,6 +11,7 @@ config = [
     "audio/audio.c",
     "graphics/mesh.c",
     "graphics/renderer.c",
+    "graphics/shader_lang.c",
     "subjects/3D/Camera.c",
     "subjects/3D/model.c",
     "subjects/3D/light/AmbientLight.c",

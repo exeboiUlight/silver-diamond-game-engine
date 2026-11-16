@@ -33,6 +33,9 @@ struct sdge_model {
 
     sdg_mat4 *static_world;
     float   **static_palette;
+
+    /* optional custom shader (not owned), see sdge_model_set_shader() */
+    sdgr_shader *shader;
 };
 
 static void m_world_from_locals(const sdge_gltf_model *g,
@@ -617,6 +620,15 @@ SDGE_API unsigned sdge_model_get_node_texture(const sdge_model *m, int node,
     return m->node_tex[node][slot];
 }
 
+SDGE_API void sdge_model_set_shader(sdge_model *m, sdgr_shader *shader) {
+    if (!m) return;
+    m->shader = shader;
+}
+
+SDGE_API sdgr_shader *sdge_model_shader(const sdge_model *m) {
+    return m ? m->shader : NULL;
+}
+
 /* one drawable primitive collected for the current frame */
 typedef struct {
     sdge_mesh *gpu;
@@ -759,8 +771,9 @@ SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model) {
     /* ---- opaque first, then the blended ones back to front ---- */
     for (int i = 0; i < count; ++i) {
         if (items[i].transparent) continue;
-        sdgr_draw_mesh_ex(items[i].gpu, items[i].world, items[i].joints,
-                          items[i].joint_count, items[i].mat, items[i].tex);
+        sdgr_draw_mesh_shader(items[i].gpu, items[i].world, items[i].joints,
+                              items[i].joint_count, items[i].mat, items[i].tex,
+                              m->shader);
     }
     {
         int tc = 0;
@@ -774,8 +787,9 @@ SDGE_API void sdge_model_draw(sdge_model *m, const sdg_mat4 model) {
                     if (items[i].transparent) tr[w++] = items[i];
                 qsort(tr, (size_t)tc, sizeof(m_item), m_item_cmp_far_first);
                 for (int i = 0; i < tc; ++i)
-                    sdgr_draw_mesh_ex(tr[i].gpu, tr[i].world, tr[i].joints,
-                                      tr[i].joint_count, tr[i].mat, tr[i].tex);
+                    sdgr_draw_mesh_shader(tr[i].gpu, tr[i].world, tr[i].joints,
+                                          tr[i].joint_count, tr[i].mat,
+                                          tr[i].tex, m->shader);
                 free(tr);
             }
         }

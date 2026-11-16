@@ -70,7 +70,7 @@ tools/           вспомогательные скрипты на Python
 |---|---|---|
 | Окно | `graphics/window.h` | создание окна, ввод (клавиатура, мышь, скролл), таймеры, GLFW-подобный API |
 | Математика | `math/math3d.h` | `sdg_vec3`, `sdg_quat`, `sdg_mat4` (column-major), фрустум, `m4_invert` |
-| Рендер | `graphics/renderer.h` | один шейдер на всё: PBR-lite, до 8 точечных источников, 5 текстурных слотов, alpha-режимы, линии (`sdgr_draw_lines`) |
+| Рендер | `graphics/renderer.h` | один шейдер на всё: PBR-lite, до 8 точечных источников, 5 текстурных слотов, alpha-режимы, линии (`sdgr_draw_lines`), **свои шейдеры** (см. 4.1) |
 | Меши | `graphics/mesh.h` | загрузка примитива glTF в GPU-буферы, bounding sphere |
 | glTF | `assets/gltf.h` | загрузка `.glb` и `.gltf`+`.bin`: узлы, меши, скины, анимации, PBR-материалы, текстуры, `KHR_texture_transform` |
 | Изображения | `assets/texture.h` | декодирование PNG/JPG/BMP/TGA/HDR через **stb_image** в RGBA8 |
@@ -129,6 +129,42 @@ unsigned tex = sdgr_upload_texture_ex(img.w, img.h, img.pixels, &desc);
 Правила sRGB: **base color** и **emissive** грузятся как sRGB, карты
 normal/metallic-roughness/occlusion — как линейные данные. Это соответствует
 спецификации glTF и не даёт «выцветать» текстурам.
+
+### 4.1 Свои шейдеры
+
+Кроме встроенного PBR можно писать небольшие шейдеры на собственном языке
+(`.sdshader`). Исходник транслируется в GLSL 330 и использует тот же
+скиннинг, материалы, текстуры и свет:
+
+```
+shader glow {
+    uniform float intensity;
+    vertex {
+        position.y += sin(time + position.x * 4.0) * 0.03;
+    }
+    fragment {
+        vec3 lit = pbrLighting(normal, albedo, metallic, roughness);
+        color.rgb = mix(lit, vec3(0.2, 0.8, 1.0), intensity);
+        color.a   = baseColor.a;
+    }
+}
+```
+
+```c
+char error[1024];
+sdgr_shader *s = sdgr_shader_load_file("materials/glow.sdshader",
+                                       error, sizeof(error));
+sdgr_shader_set_float(s, "intensity", 0.7f);
+sdgr_shader_set_time(s, elapsed);
+sdge_model_set_shader(model, s);
+/* ... sdge_model_draw(model, NULL); ... */
+sdge_model_set_shader(model, NULL);
+sdgr_shader_destroy(s);
+```
+
+Полное описание языка, встроенных переменных/функций и ограничений — в
+`documentation.html`, раздел «Свои шейдеры». Пример:
+`demos/glow.sdshader`, `demos/shader_demo.c`.
 
 ---
 

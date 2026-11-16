@@ -4,10 +4,13 @@
  * itself, applications only see the sdgr_* API.
  */
 #include "renderer.h"
+#include "shader_lang.h"
+#include "../assets/assets.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #ifndef SDGE_NO_GL
 
@@ -200,21 +203,36 @@ typedef struct {
     int    vbo_cap;
 } r_lines;
 
+/* Uniform locations shared by the built-in PBR program and every custom
+ * shader program.  Programme with unused uniforms simply have -1 there. */
+typedef struct {
+    int proj, view, model, joints, skinned;
+    int cam, ambient, sundir, suncol, suni;
+    int ppos, pcol, pcount;
+    int base, metal, rough, dbl;
+    int emissive, normal_scale, occl_strength, alpha_cutoff;
+    int alpha_mode, has_tangent;
+    int tex[5];                 /* uBaseTex, uMRTex, ... */
+    int has_tex[5];             /* uHasBase, uHasMR, ... */
+    int uvxform, uvset;
+    int time, resolution;
+} r_locs;
+
 typedef struct {
     unsigned prog;
-    int loc_proj, loc_view, loc_model, loc_joints, loc_skinned;
-    int loc_cam, loc_ambient, loc_sundir, loc_suncol, loc_suni;
-    int loc_ppos, loc_pcol, loc_pcount;
-    int loc_base, loc_metal, loc_rough, loc_dbl;
-    int loc_emissive, loc_normal_scale, loc_occl_strength, loc_alpha_cutoff;
-    int loc_alpha_mode, loc_has_tangent;
-    int loc_tex[5];              /* uBaseTex, uMRTex, ... */
-    int loc_has_tex[5];         /* uHasBase, uHasMR, ... */
-    int loc_uvxform, loc_uvset;
+    r_locs loc;
 
     float view[16], proj[16], cam_pos[3];
     float frustum[6][4];
     int   point_count;
+    int   width, height;
+
+    /* light state, re-uploaded to every program (built-in and custom) */
+    float ambient[3];
+    float sun_dir[3], sun_col[3];
+    float sun_i;
+    float point_pos[SDGR_MAX_POINT_LIGHTS][4];
+    float point_col[SDGR_MAX_POINT_LIGHTS][4];
 
     r_lines lines;
 } r_state;
@@ -222,22 +240,147 @@ typedef struct {
 static r_state g_r;
 static int g_r_inited;
 
-static unsigned r_compile(unsigned type, const char *src) {
+struct sdgr_shader {
+    unsigned prog;
+    int      valid;
+    r_locs   loc;
+
+    sdsl_uniform uniforms[SDSL_MAX_UNIFORMS];
+    int          uniform_count;
+    int          uniform_loc[SDSL_MAX_UNIFORMS];
+    unsigned     uniform_tex[SDSL_MAX_UNIFORMS];
+    int          uniform_unit[SDSL_MAX_UNIFORMS];
+    int          sampler_count;
+
+    float time_value;
+
+    char *vs_src;
+    char *fs_src;
+};
+
+static void r_locs_reset(r_locs *l) {
+    memset(l, 0, sizeof(*l));
+    l->proj = l->view = l->model = l->joints = l->skinned = -1;
+    l->cam = l->ambient = l->sundir = l->suncol = l->suni = -1;
+    l->ppos = l->pcol = l->pcount = -1;
+    l->base = l->metal = l->rough = l->dbl = -1;
+    l->emissive = l->normal_scale = l->occl_strength = l->alpha_cutoff = -1;
+    l->alpha_mode = l->has_tangent = -1;
+    for (int i = 0; i < 5; ++i) { l->tex[i] = -1; l->has_tex[i] = -1; }
+    l->uvxform = l->uvset = -1;
+    l->time = l->resolution = -1;
+}
+
+static void r_locs_get(unsigned prog, r_locs *l) {
+    r_locs_reset(l);
+    l->proj    = glGetUniformLocation(prog, "uProj");
+    l->view    = glGetUniformLocation(prog, "uView");
+    l->model   = glGetUniformLocation(prog, "uModel");
+    l->joints  = glGetUniformLocation(prog, "uJoints");
+    l->skinned = glGetUniformLocation(prog, "uSkinned");
+    l->cam     = glGetUniformLocation(prog, "uCamPos");
+    l->ambient = glGetUniformLocation(prog, "uAmbient");
+    l->sundir  = glGetUniformLocation(prog, "uSunDir");
+    l->suncol  = glGetUniformLocation(prog, "uSunColor");
+    l->suni    = glGetUniformLocation(prog, "uSunI");
+    l->ppos    = glGetUniformLocation(prog, "uPointPos[0]");
+    l->pcol    = glGetUniformLocation(prog, "uPointCol[0]");
+    l->pcount  = glGetUniformLocation(prog, "uPointCount");
+    l->base    = glGetUniformLocation(prog, "uBaseColor");
+    l->metal   = glGetUniformLocation(prog, "uMetallic");
+    l->rough   = glGetUniformLocation(prog, "uRoughness");
+    l->dbl     = glGetUniformLocation(prog, "uDoubleSided");
+    l->emissive= glGetUniformLocation(prog, "uEmissive");
+    l->normal_scale = glGetUniformLocation(prog, "uNormalScale");
+    l->occl_strength = glGetUniformLocation(prog, "uOcclusionStrength");
+    l->alpha_cutoff = glGetUniformLocation(prog, "uAlphaCutoff");
+    l->alpha_mode = glGetUniformLocation(prog, "uAlphaMode");
+    l->has_tangent = glGetUniformLocation(prog, "uHasTangent");
+    {
+        static const char *tex_names[5] = {
+            "uBaseTex", "uMRTex", "uNormalTex", "uOcclusionTex", "uEmissiveTex"
+        };
+        static const char *has_names[5] = {
+            "uHasBase", "uHasMR", "uHasNormal", "uHasOcclusion", "uHasEmissive"
+        };
+        for (int i = 0; i < 5; ++i) {
+            l->tex[i] = glGetUniformLocation(prog, tex_names[i]);
+            l->has_tex[i] = glGetUniformLocation(prog, has_names[i]);
+        }
+    }
+    l->uvxform = glGetUniformLocation(prog, "uUVXform[0]");
+    l->uvset   = glGetUniformLocation(prog, "uUVSet[0]");
+    l->time    = glGetUniformLocation(prog, "uTime");
+    l->resolution = glGetUniformLocation(prog, "uResolution");
+}
+
+/* Uploads the current light state to whatever program is bound.  Custom
+ * shaders use the same uniforms as the built-in PBR program, so without this
+ * their pbrLighting() call would always see black. */
+static void r_apply_lights(const r_locs *l) {
+    if (l->ambient >= 0) glUniform3fv(l->ambient, 1, g_r.ambient);
+    if (l->sundir  >= 0) glUniform3fv(l->sundir, 1, g_r.sun_dir);
+    if (l->suncol  >= 0) glUniform3fv(l->suncol, 1, g_r.sun_col);
+    if (l->suni    >= 0) glUniform1f(l->suni, g_r.sun_i);
+    if (l->pcount  >= 0) glUniform1i(l->pcount, g_r.point_count);
+    for (int i = 0; i < g_r.point_count && i < SDGR_MAX_POINT_LIGHTS; ++i) {
+        if (l->ppos >= 0) glUniform4fv(l->ppos + i, 1, g_r.point_pos[i]);
+        if (l->pcol >= 0) glUniform4fv(l->pcol + i, 1, g_r.point_col[i]);
+    }
+}
+
+
+static unsigned r_compile_log(unsigned type, const char *src,
+                              char *log, int log_size) {
+    if (log && log_size > 0) log[0] = '\0';
     unsigned s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
     int ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        char log[2048];
+        char tmp[2048];
         GLsizei n = 0;
-        glGetShaderInfoLog(s, sizeof(log), &n, log);
-        fprintf(stderr, "renderer: shader compile failed:\n%.*s\n", (int)n, log);
+        glGetShaderInfoLog(s, sizeof(tmp), &n, tmp);
+        if (log && log_size > 0)
+            snprintf(log, (size_t)log_size, "%.*s", (int)n, tmp);
+        else
+            fprintf(stderr, "renderer: shader compile failed:\n%.*s\n",
+                    (int)n, tmp);
         glDeleteShader(s);
         return 0;
     }
     return s;
 }
+
+static unsigned r_compile(unsigned type, const char *src) {
+    return r_compile_log(type, src, NULL, 0);
+}
+
+static unsigned r_link_log(unsigned vs, unsigned fs,
+                           char *log, int log_size) {
+    if (log && log_size > 0) log[0] = '\0';
+    unsigned prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    int ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char tmp[2048];
+        GLsizei n = 0;
+        glGetProgramInfoLog(prog, sizeof(tmp), &n, tmp);
+        if (log && log_size > 0)
+            snprintf(log, (size_t)log_size, "%.*s", (int)n, tmp);
+        else
+            fprintf(stderr, "renderer: program link failed:\n%.*s\n",
+                    (int)n, tmp);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
 
 SDGE_API int sdgr_init(void) {
     if (g_r_inited) return 0;
@@ -250,64 +393,14 @@ SDGE_API int sdgr_init(void) {
     unsigned fs = r_compile(GL_FRAGMENT_SHADER, R_FS);
     if (!vs || !fs) return -1;
 
-    unsigned prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    int ok = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[2048];
-        GLsizei n = 0;
-        glGetProgramInfoLog(prog, sizeof(log), &n, log);
-        fprintf(stderr, "renderer: program link failed:\n%.*s\n", (int)n, log);
-        glDeleteProgram(prog);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
-        return -1;
-    }
+    unsigned prog = r_link_log(vs, fs, NULL, 0);
     glDeleteShader(vs);
     glDeleteShader(fs);
+    if (!prog) return -1;
 
     memset(&g_r, 0, sizeof(g_r));
     g_r.prog = prog;
-    g_r.loc_proj    = glGetUniformLocation(prog, "uProj");
-    g_r.loc_view    = glGetUniformLocation(prog, "uView");
-    g_r.loc_model   = glGetUniformLocation(prog, "uModel");
-    g_r.loc_joints  = glGetUniformLocation(prog, "uJoints");
-    g_r.loc_skinned = glGetUniformLocation(prog, "uSkinned");
-    g_r.loc_cam     = glGetUniformLocation(prog, "uCamPos");
-    g_r.loc_ambient = glGetUniformLocation(prog, "uAmbient");
-    g_r.loc_sundir  = glGetUniformLocation(prog, "uSunDir");
-    g_r.loc_suncol  = glGetUniformLocation(prog, "uSunColor");
-    g_r.loc_suni    = glGetUniformLocation(prog, "uSunI");
-    g_r.loc_ppos    = glGetUniformLocation(prog, "uPointPos[0]");
-    g_r.loc_pcol    = glGetUniformLocation(prog, "uPointCol[0]");
-    g_r.loc_pcount  = glGetUniformLocation(prog, "uPointCount");
-    g_r.loc_base    = glGetUniformLocation(prog, "uBaseColor");
-    g_r.loc_metal   = glGetUniformLocation(prog, "uMetallic");
-    g_r.loc_rough   = glGetUniformLocation(prog, "uRoughness");
-    g_r.loc_dbl     = glGetUniformLocation(prog, "uDoubleSided");
-    g_r.loc_emissive= glGetUniformLocation(prog, "uEmissive");
-    g_r.loc_normal_scale = glGetUniformLocation(prog, "uNormalScale");
-    g_r.loc_occl_strength = glGetUniformLocation(prog, "uOcclusionStrength");
-    g_r.loc_alpha_cutoff = glGetUniformLocation(prog, "uAlphaCutoff");
-    g_r.loc_alpha_mode = glGetUniformLocation(prog, "uAlphaMode");
-    g_r.loc_has_tangent = glGetUniformLocation(prog, "uHasTangent");
-    {
-        static const char *tex_names[5] = {
-            "uBaseTex", "uMRTex", "uNormalTex", "uOcclusionTex", "uEmissiveTex"
-        };
-        static const char *has_names[5] = {
-            "uHasBase", "uHasMR", "uHasNormal", "uHasOcclusion", "uHasEmissive"
-        };
-        for (int i = 0; i < 5; ++i) {
-            g_r.loc_tex[i] = glGetUniformLocation(prog, tex_names[i]);
-            g_r.loc_has_tex[i] = glGetUniformLocation(prog, has_names[i]);
-        }
-    }
-    g_r.loc_uvxform = glGetUniformLocation(prog, "uUVXform[0]");
-    g_r.loc_uvset  = glGetUniformLocation(prog, "uUVSet[0]");
+    r_locs_get(prog, &g_r.loc);
 
     /* the line program (the gizmos of the scene editor) */
     {
@@ -338,6 +431,8 @@ SDGE_API int sdgr_init(void) {
     m4_identity(g_r.view);
     m4_identity(g_r.proj);
     g_r.point_count = 0;
+    g_r.width = 1;
+    g_r.height = 1;
     g_r_inited = 1;
     sdgr_set_ambient(0.2f, 0.2f, 0.25f);
     {
@@ -359,7 +454,9 @@ SDGE_API void sdgr_shutdown(void) {
 
 SDGE_API void sdgr_resize(int width, int height) {
     if (!g_r_inited) return;
-    glViewport(0, 0, width > 0 ? width : 1, height > 0 ? height : 1);
+    g_r.width  = width  > 0 ? width  : 1;
+    g_r.height = height > 0 ? height : 1;
+    glViewport(0, 0, g_r.width, g_r.height);
 }
 
 SDGE_API void sdgr_begin_frame(const float clear_color[4]) {
@@ -374,9 +471,9 @@ SDGE_API void sdgr_begin_frame(const float clear_color[4]) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glUseProgram(g_r.prog);
     g_r.point_count = 0;
-    glUniform1i(g_r.loc_pcount, 0);
+    glUniform1i(g_r.loc.pcount, 0);
     for (int i = 0; i < SDGR_TEX_SLOTS; ++i)
-        if (g_r.loc_has_tex[i] >= 0) glUniform1i(g_r.loc_has_tex[i], 0);
+        if (g_r.loc.has_tex[i] >= 0) glUniform1i(g_r.loc.has_tex[i], 0);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
 }
@@ -402,8 +499,9 @@ SDGE_API int sdgr_sphere_visible(const float center[3], float radius) {
 
 SDGE_API void sdgr_set_ambient(float r, float g, float b) {
     if (!g_r_inited) return;
+    g_r.ambient[0] = r; g_r.ambient[1] = g; g_r.ambient[2] = b;
     glUseProgram(g_r.prog);
-    glUniform3f(g_r.loc_ambient, r, g, b);
+    r_apply_lights(&g_r.loc);
 }
 
 SDGE_API void sdgr_set_sun(const float dir[3], const float color[3],
@@ -414,10 +512,11 @@ SDGE_API void sdgr_set_sun(const float dir[3], const float color[3],
     if (color) memcpy(c, color, sizeof(float) * 3);
     float len = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
     if (len > 1e-9f) { d[0] /= len; d[1] /= len; d[2] /= len; }
+    memcpy(g_r.sun_dir, d, sizeof(d));
+    memcpy(g_r.sun_col, c, sizeof(c));
+    g_r.sun_i = intensity;
     glUseProgram(g_r.prog);
-    glUniform3fv(g_r.loc_sundir, 1, d);
-    glUniform3fv(g_r.loc_suncol, 1, c);
-    glUniform1f(g_r.loc_suni, intensity);
+    r_apply_lights(&g_r.loc);
 }
 
 SDGE_API void sdgr_set_point_light(int index, const float pos[3],
@@ -425,18 +524,15 @@ SDGE_API void sdgr_set_point_light(int index, const float pos[3],
                                    float intensity, float radius) {
     if (!g_r_inited) return;
     if (index < 0 || index >= SDGR_MAX_POINT_LIGHTS) return;
-    float p[4], c[4];
+    float *p = g_r.point_pos[index];
+    float *c = g_r.point_col[index];
     p[0] = pos ? pos[0] : 0; p[1] = pos ? pos[1] : 0;
     p[2] = pos ? pos[2] : 0; p[3] = radius > 0.0f ? radius : 1.0f;
     c[0] = color ? color[0] : 1; c[1] = color ? color[1] : 1;
     c[2] = color ? color[2] : 1; c[3] = intensity;
+    if (index + 1 > g_r.point_count) g_r.point_count = index + 1;
     glUseProgram(g_r.prog);
-    glUniform4fv(g_r.loc_ppos + index, 1, p);
-    glUniform4fv(g_r.loc_pcol + index, 1, c);
-    if (index + 1 > g_r.point_count) {
-        g_r.point_count = index + 1;
-        glUniform1i(g_r.loc_pcount, g_r.point_count);
-    }
+    r_apply_lights(&g_r.loc);
 }
 
 SDGE_API unsigned sdgr_upload_texture(int w, int h,
@@ -515,23 +611,27 @@ static void r_uv_matrix(float out[9], const sdgr_material *m, int slot) {
     out[8] = 1.0f;
 }
 
-static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
-                        const float *joints, int joint_count,
-                        const sdgr_material *mat, const sdgr_texture_set *tex) {
+static void r_draw_mesh_program(unsigned prog, const r_locs *loc,
+                                const sdge_mesh *mesh, const sdg_mat4 model,
+                                const float *joints, int joint_count,
+                                const sdgr_material *mat,
+                                const sdgr_texture_set *tex,
+                                sdgr_shader *shader) {
     if (!g_r_inited || !mesh || !mesh->vao) return;
 
     int skinned = (mesh->has_skin && joints && joint_count > 0);
     if (skinned && joint_count > SDGR_MAX_JOINTS) joint_count = SDGR_MAX_JOINTS;
 
-    glUseProgram(g_r.prog);
-    glUniformMatrix4fv(g_r.loc_proj, 1, GL_FALSE, g_r.proj);
-    glUniformMatrix4fv(g_r.loc_view, 1, GL_FALSE, g_r.view);
-    glUniformMatrix4fv(g_r.loc_model, 1, GL_FALSE,
+    glUseProgram(prog);
+    r_apply_lights(loc);
+    glUniformMatrix4fv(loc->proj, 1, GL_FALSE, g_r.proj);
+    glUniformMatrix4fv(loc->view, 1, GL_FALSE, g_r.view);
+    glUniformMatrix4fv(loc->model, 1, GL_FALSE,
                        model ? model : r_identity());
-    glUniform1i(g_r.loc_skinned, skinned ? 1 : 0);
+    glUniform1i(loc->skinned, skinned ? 1 : 0);
     if (skinned)
-        glUniformMatrix4fv(g_r.loc_joints, joint_count, GL_FALSE, joints);
-    glUniform3fv(g_r.loc_cam, 1, g_r.cam_pos);
+        glUniformMatrix4fv(loc->joints, joint_count, GL_FALSE, joints);
+    glUniform3fv(loc->cam, 1, g_r.cam_pos);
 
     float bc[4] = { 0.8f, 0.8f, 0.8f, 1.0f };
     float em[3] = { 0.0f, 0.0f, 0.0f };
@@ -550,16 +650,24 @@ static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
         alpha_mode = mat->alpha_mode;
         double_sided = double_sided || mat->double_sided;
     }
-    glUniform4fv(g_r.loc_base, 1, bc);
-    glUniform3fv(g_r.loc_emissive, 1, em);
-    glUniform1f(g_r.loc_metal, metallic);
-    glUniform1f(g_r.loc_rough, roughness < 0.045f ? 0.045f : roughness);
-    glUniform1f(g_r.loc_normal_scale, normal_scale);
-    glUniform1f(g_r.loc_occl_strength, occl);
-    glUniform1f(g_r.loc_alpha_cutoff, cutoff);
-    glUniform1i(g_r.loc_alpha_mode, alpha_mode);
-    glUniform1i(g_r.loc_dbl, double_sided ? 1 : 0);
-    glUniform1i(g_r.loc_has_tangent, 0);
+    glUniform4fv(loc->base, 1, bc);
+    glUniform3fv(loc->emissive, 1, em);
+    glUniform1f(loc->metal, metallic);
+    glUniform1f(loc->rough, roughness < 0.045f ? 0.045f : roughness);
+    glUniform1f(loc->normal_scale, normal_scale);
+    glUniform1f(loc->occl_strength, occl);
+    glUniform1f(loc->alpha_cutoff, cutoff);
+    glUniform1i(loc->alpha_mode, alpha_mode);
+    glUniform1i(loc->dbl, double_sided ? 1 : 0);
+    glUniform1i(loc->has_tangent, 0);
+
+    if (shader) {
+        if (loc->time >= 0) glUniform1f(loc->time, shader->time_value);
+        if (loc->resolution >= 0)
+            glUniform2f(loc->resolution,
+                        (float)(g_r.width > 0 ? g_r.width : 1),
+                        (float)(g_r.height > 0 ? g_r.height : 1));
+    }
 
     /* ---- textures: one sampler unit per slot ---- */
     unsigned texid[SDGR_TEX_SLOTS] = { 0, 0, 0, 0, 0 };
@@ -571,13 +679,25 @@ static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
         texid[SDGR_SLOT_EMISSIVE]  = tex->emissive;
     }
     for (int i = 0; i < SDGR_TEX_SLOTS; ++i) {
-        int has = (texid[i] != 0 && mesh->has_texcoords); if (i == SDGR_SLOT_NORMAL) has = 0;
-        if (g_r.loc_has_tex[i] >= 0) glUniform1i(g_r.loc_has_tex[i], has);
-        if (g_r.loc_tex[i] >= 0) {
+        int has = (texid[i] != 0 && mesh->has_texcoords);
+        if (i == SDGR_SLOT_NORMAL) has = 0;
+        if (loc->has_tex[i] >= 0) glUniform1i(loc->has_tex[i], has);
+        if (loc->tex[i] >= 0) {
             glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, has ? texid[i] : 0);
-            glUniform1i(g_r.loc_tex[i], i);
+            glUniform1i(loc->tex[i], i);
         }
+    }
+
+    /* ---- user sampler uniforms (custom shaders, units 5+) ---- */
+    if (shader) {
+        for (int i = 0; i < shader->uniform_count; ++i) {
+            if (shader->uniforms[i].type != SDSL_UNIFORM_SAMPLER2D) continue;
+            if (shader->uniform_loc[i] < 0) continue;
+            glActiveTexture(GL_TEXTURE0 + (unsigned)shader->uniform_unit[i]);
+            glBindTexture(GL_TEXTURE_2D, shader->uniform_tex[i]);
+        }
+        glActiveTexture(GL_TEXTURE0);
     }
 
     /* ---- UV sets and per-slot texture transforms ---- */
@@ -594,10 +714,10 @@ static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
                 sets[i] = 0;
             }
         }
-        if (g_r.loc_uvxform >= 0)
-            glUniformMatrix3fv(g_r.loc_uvxform, SDGR_TEX_SLOTS, GL_FALSE, &xf[0][0]);
-        if (g_r.loc_uvset >= 0)
-            glUniform1iv(g_r.loc_uvset, SDGR_TEX_SLOTS, sets);
+        if (loc->uvxform >= 0)
+            glUniformMatrix3fv(loc->uvxform, SDGR_TEX_SLOTS, GL_FALSE, &xf[0][0]);
+        if (loc->uvset >= 0)
+            glUniform1iv(loc->uvset, SDGR_TEX_SLOTS, sets);
     }
 
     /* ---- alpha mode / culling ---- */
@@ -638,6 +758,28 @@ static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
     }
 }
 
+static void r_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
+                        const float *joints, int joint_count,
+                        const sdgr_material *mat, const sdgr_texture_set *tex) {
+    r_draw_mesh_program(g_r.prog, &g_r.loc, mesh, model, joints, joint_count,
+                        mat, tex, NULL);
+}
+
+SDGE_API void sdgr_draw_mesh_shader(const sdge_mesh *mesh,
+                                    const sdg_mat4 model,
+                                    const float *joints, int joint_count,
+                                    const sdgr_material *mat,
+                                    const sdgr_texture_set *tex,
+                                    sdgr_shader *shader) {
+    if (!shader || !shader->valid) {
+        r_draw_mesh(mesh, model, joints, joint_count, mat, tex);
+        return;
+    }
+    r_draw_mesh_program(shader->prog, &shader->loc, mesh, model, joints,
+                        joint_count, mat, tex, shader);
+}
+
+
 SDGE_API void sdgr_draw_mesh(const sdge_mesh *mesh, const sdg_mat4 model,
                              const float *joints, int joint_count,
                              const float base_color[4],
@@ -669,6 +811,233 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *mesh, const sdg_mat4 model,
                                 const sdgr_material *mat,
                                 const sdgr_texture_set *tex) {
     r_draw_mesh(mesh, model, joints, joint_count, mat, tex);
+}
+
+/* -------------------------------------------------------- custom shaders */
+
+#define R_SHADER_FIRST_TEXTURE_UNIT 5   /* after the five material slots */
+
+static int r_set_error(char *error, int error_size, const char *fmt, ...) {
+    if (error && error_size > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(error, (size_t)error_size, fmt, ap);
+        va_end(ap);
+    }
+    return 0;
+}
+
+static int r_shader_uniform_index(const sdgr_shader *s, const char *name) {
+    if (!s || !name) return -1;
+    for (int i = 0; i < s->uniform_count; ++i)
+        if (strcmp(s->uniforms[i].name, name) == 0) return i;
+    return -1;
+}
+
+SDGE_API sdgr_shader *sdgr_shader_compile(const char *source,
+                                          char *error, int error_size) {
+    if (error && error_size > 0) error[0] = '\0';
+    if (!g_r_inited) {
+        r_set_error(error, error_size,
+                    "renderer is not initialized (call sdgr_init first)");
+        return NULL;
+    }
+    if (!source) {
+        r_set_error(error, error_size, "empty shader source");
+        return NULL;
+    }
+
+    sdsl_program sp;
+    if (sdsl_compile(source, &sp, error, error_size) != 0) return NULL;
+
+    char log[2048];
+    unsigned vs = r_compile_log(GL_VERTEX_SHADER, sp.vertex, log, sizeof(log));
+    if (!vs) {
+        r_set_error(error, error_size, "vertex GLSL error: %s", log);
+        sdsl_program_free(&sp);
+        return NULL;
+    }
+    unsigned fs = r_compile_log(GL_FRAGMENT_SHADER, sp.fragment,
+                                log, sizeof(log));
+    if (!fs) {
+        r_set_error(error, error_size, "fragment GLSL error: %s", log);
+        glDeleteShader(vs);
+        sdsl_program_free(&sp);
+        return NULL;
+    }
+    unsigned prog = r_link_log(vs, fs, log, sizeof(log));
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!prog) {
+        r_set_error(error, error_size, "GLSL link error: %s", log);
+        sdsl_program_free(&sp);
+        return NULL;
+    }
+
+    sdgr_shader *s = (sdgr_shader *)calloc(1, sizeof(*s));
+    if (!s) {
+        glDeleteProgram(prog);
+        sdsl_program_free(&sp);
+        r_set_error(error, error_size, "out of memory");
+        return NULL;
+    }
+    s->prog = prog;
+    s->valid = 1;
+    r_locs_get(prog, &s->loc);
+
+    s->uniform_count = sp.uniform_count;
+    s->sampler_count = 0;
+    for (int i = 0; i < sp.uniform_count; ++i) {
+        s->uniforms[i] = sp.uniforms[i];
+        s->uniform_loc[i] = glGetUniformLocation(prog, sp.uniforms[i].name);
+        s->uniform_tex[i] = 0;
+        s->uniform_unit[i] = 0;
+        if (sp.uniforms[i].type == SDSL_UNIFORM_SAMPLER2D) {
+            int unit = R_SHADER_FIRST_TEXTURE_UNIT + s->sampler_count++;
+            s->uniform_unit[i] = unit;
+            if (s->uniform_loc[i] >= 0) {
+                glUseProgram(prog);
+                glUniform1i(s->uniform_loc[i], unit);
+            }
+        }
+    }
+    glUseProgram(g_r.prog);
+
+    s->vs_src = sp.vertex;
+    s->fs_src = sp.fragment;
+    sp.vertex = NULL;
+    sp.fragment = NULL;
+    sdsl_program_free(&sp);
+    return s;
+}
+
+SDGE_API sdgr_shader *sdgr_shader_load_file(const char *path,
+                                            char *error, int error_size) {
+    if (error && error_size > 0) error[0] = '\0';
+    if (!path) {
+        r_set_error(error, error_size, "no shader path given");
+        return NULL;
+    }
+    unsigned char *data = NULL;
+    size_t size = 0;
+    if (sdga_read_file(path, &data, &size) != 0) {
+        r_set_error(error, error_size, "cannot read shader file '%s'", path);
+        return NULL;
+    }
+    char *text = (char *)malloc(size + 1);
+    if (!text) {
+        free(data);
+        r_set_error(error, error_size, "out of memory");
+        return NULL;
+    }
+    if (size > 0) memcpy(text, data, size);
+    text[size] = '\0';
+    free(data);
+
+    sdgr_shader *s = sdgr_shader_compile(text, error, error_size);
+    free(text);
+    return s;
+}
+
+SDGE_API void sdgr_shader_destroy(sdgr_shader *shader) {
+    if (!shader) return;
+    if (shader->prog) glDeleteProgram(shader->prog);
+    free(shader->vs_src);
+    free(shader->fs_src);
+    free(shader);
+}
+
+SDGE_API int sdgr_shader_valid(const sdgr_shader *shader) {
+    return shader && shader->valid ? 1 : 0;
+}
+
+SDGE_API const char *sdgr_shader_vertex_glsl(const sdgr_shader *shader) {
+    return shader ? shader->vs_src : NULL;
+}
+
+SDGE_API const char *sdgr_shader_fragment_glsl(const sdgr_shader *shader) {
+    return shader ? shader->fs_src : NULL;
+}
+
+SDGE_API int sdgr_shader_set_float(sdgr_shader *s, const char *name,
+                                   float value) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0 || s->uniforms[i].type != SDSL_UNIFORM_FLOAT) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    glUseProgram(s->prog);
+    glUniform1f(s->uniform_loc[i], value);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API int sdgr_shader_set_int(sdgr_shader *s, const char *name, int value) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0) return 0;
+    if (s->uniforms[i].type != SDSL_UNIFORM_INT &&
+        s->uniforms[i].type != SDSL_UNIFORM_BOOL) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    glUseProgram(s->prog);
+    glUniform1i(s->uniform_loc[i], value);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API int sdgr_shader_set_vec2(sdgr_shader *s, const char *name,
+                                  float x, float y) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0 || s->uniforms[i].type != SDSL_UNIFORM_VEC2) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    glUseProgram(s->prog);
+    glUniform2f(s->uniform_loc[i], x, y);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API int sdgr_shader_set_vec3(sdgr_shader *s, const char *name,
+                                  float x, float y, float z) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0 || s->uniforms[i].type != SDSL_UNIFORM_VEC3) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    glUseProgram(s->prog);
+    glUniform3f(s->uniform_loc[i], x, y, z);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API int sdgr_shader_set_vec4(sdgr_shader *s, const char *name,
+                                  float x, float y, float z, float w) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0 || s->uniforms[i].type != SDSL_UNIFORM_VEC4) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    glUseProgram(s->prog);
+    glUniform4f(s->uniform_loc[i], x, y, z, w);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API int sdgr_shader_set_texture(sdgr_shader *s, const char *name,
+                                     unsigned texture) {
+    if (!s || !s->valid) return 0;
+    int i = r_shader_uniform_index(s, name);
+    if (i < 0 || s->uniforms[i].type != SDSL_UNIFORM_SAMPLER2D) return 0;
+    if (s->uniform_loc[i] < 0) return 0;
+    s->uniform_tex[i] = texture;
+    glUseProgram(s->prog);
+    glActiveTexture(GL_TEXTURE0 + (unsigned)s->uniform_unit[i]);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(s->uniform_loc[i], s->uniform_unit[i]);
+    glActiveTexture(GL_TEXTURE0);
+    glUseProgram(g_r.prog);
+    return 1;
+}
+
+SDGE_API void sdgr_shader_set_time(sdgr_shader *shader, float seconds) {
+    if (shader) shader->time_value = seconds;
 }
 
 /* ------------------------------------------------------------------ lines */
@@ -820,6 +1189,60 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *m, const sdg_mat4 mo,
                                 const float *j, int jc, const sdgr_material *mat,
                                 const sdgr_texture_set *tex) {
     (void)m; (void)mo; (void)j; (void)jc; (void)mat; (void)tex;
+}
+SDGE_API sdgr_shader *sdgr_shader_compile(const char *src,
+                                          char *error, int error_size) {
+    (void)src;
+    if (error && error_size > 0)
+        snprintf(error, (size_t)error_size,
+                 "this build has no OpenGL (SDGE_NO_GL)");
+    return NULL;
+}
+SDGE_API sdgr_shader *sdgr_shader_load_file(const char *path,
+                                            char *error, int error_size) {
+    (void)path;
+    if (error && error_size > 0)
+        snprintf(error, (size_t)error_size,
+                 "this build has no OpenGL (SDGE_NO_GL)");
+    return NULL;
+}
+SDGE_API void sdgr_shader_destroy(sdgr_shader *s) { (void)s; }
+SDGE_API int  sdgr_shader_valid(const sdgr_shader *s) { (void)s; return 0; }
+SDGE_API const char *sdgr_shader_vertex_glsl(const sdgr_shader *s) {
+    (void)s; return NULL;
+}
+SDGE_API const char *sdgr_shader_fragment_glsl(const sdgr_shader *s) {
+    (void)s; return NULL;
+}
+SDGE_API int sdgr_shader_set_float(sdgr_shader *s, const char *n, float v) {
+    (void)s; (void)n; (void)v; return 0;
+}
+SDGE_API int sdgr_shader_set_int(sdgr_shader *s, const char *n, int v) {
+    (void)s; (void)n; (void)v; return 0;
+}
+SDGE_API int sdgr_shader_set_vec2(sdgr_shader *s, const char *n,
+                                  float x, float y) {
+    (void)s; (void)n; (void)x; (void)y; return 0;
+}
+SDGE_API int sdgr_shader_set_vec3(sdgr_shader *s, const char *n,
+                                  float x, float y, float z) {
+    (void)s; (void)n; (void)x; (void)y; (void)z; return 0;
+}
+SDGE_API int sdgr_shader_set_vec4(sdgr_shader *s, const char *n,
+                                  float x, float y, float z, float w) {
+    (void)s; (void)n; (void)x; (void)y; (void)z; (void)w; return 0;
+}
+SDGE_API int sdgr_shader_set_texture(sdgr_shader *s, const char *n,
+                                     unsigned tex) {
+    (void)s; (void)n; (void)tex; return 0;
+}
+SDGE_API void sdgr_shader_set_time(sdgr_shader *s, float t) { (void)s; (void)t; }
+SDGE_API void sdgr_draw_mesh_shader(const sdge_mesh *m, const sdg_mat4 mo,
+                                    const float *j, int jc,
+                                    const sdgr_material *mat,
+                                    const sdgr_texture_set *tex,
+                                    sdgr_shader *s) {
+    (void)m; (void)mo; (void)j; (void)jc; (void)mat; (void)tex; (void)s;
 }
 SDGE_API void sdgr_draw_lines(const float *v, int vc, const float c[4]) {
     (void)v; (void)vc; (void)c;

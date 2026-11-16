@@ -146,6 +146,76 @@ SDGE_API void sdgr_draw_mesh_ex(const sdge_mesh *mesh, const sdg_mat4 model,
                                 const sdgr_material *mat,
                                 const sdgr_texture_set *tex);
 
+/* ------------------------------------------------------- custom shaders
+ * A small, deliberately simple shader language (see documentation.html,
+ * section "custom shaders").  A shader replaces the fragment stage of the
+ * forward renderer and may also tweak the vertex position/normal/UVs:
+ *
+ *     shader glow {
+ *         uniform float intensity;
+ *         vertex {
+ *             position.y += sin(time + position.x * 4.0) * 0.05;
+ *         }
+ *         fragment {
+ *             vec3 lit = pbrLighting(normal, albedo, metallic, roughness);
+ *             color.rgb = mix(lit, vec3(0.2, 0.8, 1.0), intensity);
+ *         }
+ *     }
+ *
+ * `source` is UTF-8 text; `sdgr_shader_load_file` reads a file (the usual
+ * extension is .sdshader).  Both return NULL on a language or GLSL error and
+ * write a message to `error` when it is not NULL:
+ *
+ *     char err[512];
+ *     sdgr_shader *s = sdgr_shader_load_file("materials/glow.sdshader",
+ *                                            err, sizeof(err));
+ *     if (!s) fprintf(stderr, "%s\n", err);
+ *
+ * A shader is not owned by a model or a draw call: destroy it manually with
+ * sdgr_shader_destroy() when it is no longer used.
+ */
+typedef struct sdgr_shader sdgr_shader;
+
+SDGE_API sdgr_shader *sdgr_shader_compile(const char *source,
+                                          char *error, int error_size);
+SDGE_API sdgr_shader *sdgr_shader_load_file(const char *path,
+                                            char *error, int error_size);
+SDGE_API void sdgr_shader_destroy(sdgr_shader *shader);
+SDGE_API int  sdgr_shader_valid(const sdgr_shader *shader);
+
+/* the generated GLSL - useful for debugging a driver error */
+SDGE_API const char *sdgr_shader_vertex_glsl(const sdgr_shader *shader);
+SDGE_API const char *sdgr_shader_fragment_glsl(const sdgr_shader *shader);
+
+/* user uniforms declared in the shader; each returns 1 when the uniform was
+ * found and has a compatible type, otherwise 0. */
+SDGE_API int sdgr_shader_set_float(sdgr_shader *shader, const char *name,
+                                   float value);
+SDGE_API int sdgr_shader_set_int(sdgr_shader *shader, const char *name,
+                                 int value);
+SDGE_API int sdgr_shader_set_vec2(sdgr_shader *shader, const char *name,
+                                  float x, float y);
+SDGE_API int sdgr_shader_set_vec3(sdgr_shader *shader, const char *name,
+                                  float x, float y, float z);
+SDGE_API int sdgr_shader_set_vec4(sdgr_shader *shader, const char *name,
+                                  float x, float y, float z, float w);
+SDGE_API int sdgr_shader_set_texture(sdgr_shader *shader, const char *name,
+                                     unsigned texture);
+
+/* the built-in `time` variable of the language (seconds) */
+SDGE_API void sdgr_shader_set_time(sdgr_shader *shader, float seconds);
+
+/* draw one mesh with the custom shader.  The material and the standard five
+ * texture slots are the same as sdgr_draw_mesh_ex(); user samplers declared
+ * in the shader are bound with sdgr_shader_set_texture(). */
+SDGE_API void sdgr_draw_mesh_shader(const sdge_mesh *mesh,
+                                    const sdg_mat4 model,
+                                    const float *joints, int joint_count,
+                                    const sdgr_material *mat,
+                                    const sdgr_texture_set *tex,
+                                    sdgr_shader *shader);
+
+
 /* ------------------------------------------------------------------ lines
  * A simple line batch for the debug helpers and the scene editor gizmos.
  * `vertices` is a list of xyz triples, every two of them form one line:

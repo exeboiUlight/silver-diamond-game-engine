@@ -28,7 +28,7 @@
 extern "C" {
 #endif
 
-#define SDGE_GUI_MAX_WIDGETS 64
+#define SDGE_GUI_MAX_WIDGETS 256
 
 /* widget event types (delivered to sdge_widget::event) */
 #define SDGE_WIDGET_CLICK   1

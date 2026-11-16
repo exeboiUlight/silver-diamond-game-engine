@@ -51,9 +51,11 @@ typedef struct sdge_editor sdge_editor;   /* opaque */
 #define SDGE_EDIT_TEX_OCCLUSION 3
 #define SDGE_EDIT_TEX_EMISSIVE  4
 
-/* one row of the hierarchy */
+/* one row of the hierarchy: either the root of a scene object (node = -1)
+ * or one glTF node inside that object */
 typedef struct {
-    int  node;            /* the index of the glTF node */
+    int  object;          /* the scene object that owns the row */
+    int  node;            /* the index of the glTF node, -1 = the object row */
     int  depth;           /* the depth in the tree */
     int  has_mesh;
     char name[96];
@@ -71,10 +73,56 @@ SDGE_API sdge_model *sdge_editor_model(const sdge_editor *ed);
 
 /* --------------------------------------------------------- the hierarchy */
 SDGE_API int sdge_editor_item_count(const sdge_editor *ed);
+SDGE_API int sdge_editor_item_object(const sdge_editor *ed, int item);
 SDGE_API int sdge_editor_item_node(const sdge_editor *ed, int item);
 SDGE_API const char *sdge_editor_item_name(const sdge_editor *ed, int item);
 SDGE_API int sdge_editor_item_depth(const sdge_editor *ed, int item);
 SDGE_API int sdge_editor_item_has_mesh(const sdge_editor *ed, int item);
+
+/* ----------------------------------------------------- the scene objects
+ * A scene is a list of objects; every object is either empty or owns one
+ * glTF model.  The rows of the hierarchy are the object roots followed by
+ * the nodes of their model.  The full scene can be saved as a .sdscene
+ * file (JSON), so the editor really edits scenes and not just one model. */
+SDGE_API int sdge_editor_object_count(const sdge_editor *ed);
+SDGE_API int sdge_editor_add_object(sdge_editor *ed, const char *path,
+                                     const char *name);   /* the index */
+SDGE_API int sdge_editor_add_empty(sdge_editor *ed, const char *name);
+SDGE_API int sdge_editor_remove_object(sdge_editor *ed, int object);
+SDGE_API int sdge_editor_duplicate_object(sdge_editor *ed, int object);
+SDGE_API int sdge_editor_active_object(const sdge_editor *ed);
+SDGE_API void sdge_editor_set_active_object(sdge_editor *ed, int object);
+SDGE_API int sdge_editor_select_object(sdge_editor *ed, int object);
+SDGE_API sdge_model *sdge_editor_object_model(const sdge_editor *ed,
+                                              int object);
+
+SDGE_API const char *sdge_editor_object_name(const sdge_editor *ed, int object);
+SDGE_API void sdge_editor_set_object_name(sdge_editor *ed, int object,
+                                          const char *name);
+SDGE_API const char *sdge_editor_object_path(const sdge_editor *ed, int object);
+SDGE_API int sdge_editor_object_visible(const sdge_editor *ed, int object);
+SDGE_API void sdge_editor_set_object_visible(sdge_editor *ed, int object,
+                                             int visible);
+SDGE_API int sdge_editor_object_expanded(const sdge_editor *ed, int object);
+SDGE_API void sdge_editor_set_object_expanded(sdge_editor *ed, int object,
+                                              int expanded);
+SDGE_API int sdge_editor_get_object_transform(sdge_editor *ed, int object,
+                                              sdg_vec3 t, sdg_quat r,
+                                              sdg_vec3 s);
+SDGE_API int sdge_editor_set_object_transform(sdge_editor *ed, int object,
+                                              const sdg_vec3 t,
+                                              const sdg_quat r,
+                                              const sdg_vec3 s);
+
+/* ---------------------------------------------------------- the scene file */
+SDGE_API void sdge_editor_new_scene(sdge_editor *ed, const char *name);
+SDGE_API int  sdge_editor_load_scene(sdge_editor *ed, const char *path);
+SDGE_API int  sdge_editor_save_scene(sdge_editor *ed, const char *path);
+SDGE_API const char *sdge_editor_scene_name(const sdge_editor *ed);
+SDGE_API void sdge_editor_set_scene_name(sdge_editor *ed, const char *name);
+SDGE_API const char *sdge_editor_scene_path(const sdge_editor *ed);
+SDGE_API int  sdge_editor_scene_dirty(const sdge_editor *ed);
+SDGE_API void sdge_editor_set_scene_dirty(sdge_editor *ed, int dirty);
 
 /* the selection (an item index, -1 = nothing is selected) */
 SDGE_API void sdge_editor_select(sdge_editor *ed, int item);
@@ -120,6 +168,22 @@ SDGE_API int sdge_editor_pick(sdge_editor *ed, float x, float y);
 /* draws the model and the gizmos of the selected node */
 SDGE_API void sdge_editor_render(sdge_editor *ed);
 
+/* --------------------------------------------------------------- play mode
+ * The play mode only drives the animation players of the objects; the node
+ * transforms are not changed, so Stop restores the static pose. */
+#define SDGE_EDIT_PLAY_STOPPED 0
+#define SDGE_EDIT_PLAY_PLAYING 1
+#define SDGE_EDIT_PLAY_PAUSED  2
+
+SDGE_API void sdge_editor_set_play_state(sdge_editor *ed, int state);
+SDGE_API int  sdge_editor_play_state(const sdge_editor *ed);
+/* advances the animations; call once per frame with the frame time */
+SDGE_API void sdge_editor_advance(sdge_editor *ed, float dt);
+
+/* the ground grid of the scene view (on by default) */
+SDGE_API void sdge_editor_set_grid_visible(sdge_editor *ed, int visible);
+SDGE_API int  sdge_editor_grid_visible(const sdge_editor *ed);
+
 /* ---------------------------------------------------------- the textures */
 /* puts a texture on a node (the file is decoded with stb_image and uploaded
  * to the GPU); 0 = ok.  `slot` is one of SDGE_EDIT_TEX_* */
@@ -130,10 +194,13 @@ SDGE_API int sdge_editor_clear_texture(sdge_editor *ed, int item, int slot);
 /* the file of the texture that was put on a node (NULL = none) */
 SDGE_API const char *sdge_editor_texture_path(sdge_editor *ed, int node,
                                                int slot);
+SDGE_API const char *sdge_editor_texture_path_for(sdge_editor *ed, int object,
+                                                   int node, int slot);
 
 /* ------------------------------------------------------------- the export */
-/* writes the edited model as a glTF file (the binary data goes into
- * <name>.bin, the textures are embedded as data URIs); 0 = ok */
+/* writes the active object as a glTF file (the binary data goes into
+ * <name>.bin, the textures are embedded as data URIs); 0 = ok.
+ * Use sdge_editor_save_scene() for the whole scene. */
 SDGE_API int sdge_editor_export(sdge_editor *ed, const char *path);
 /* the message of the last error (an empty string = no error) */
 SDGE_API const char *sdge_editor_error(const sdge_editor *ed);
