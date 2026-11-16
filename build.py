@@ -109,6 +109,7 @@ class Main:
             "graphics/mesh.h",
             "graphics/renderer.h",
             "graphics/ui.h",
+            "graphics/shader_lang.h"
             "subjects/3D/Camera.h",
             "subjects/3D/model.h",
             "subjects/3D/light/AmbientLight.h",
